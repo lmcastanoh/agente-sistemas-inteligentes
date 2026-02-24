@@ -1,7 +1,6 @@
 # backend/app.py
 from __future__ import annotations
 
-import json
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
@@ -40,19 +39,12 @@ async def chat_stream(req: ChatRequest):
     async def event_gen():
         inputs = {"question": req.question, "docs": [], "answer": ""}
 
-        # "messages" streams (token, metadata) tuples from LLM-invoking nodes :contentReference[oaicite:13]{index=13}
         async for chunk in graph.astream(inputs, stream_mode="messages"):
-            # chunk is typically: (token, metadata) or structured tuples depending on runtime
-            # We'll normalize to a "token" string for the UI.
             try:
-                token, meta = chunk  # many providers yield (token, metadata)
-                yield {"event": "token", "data": token}
+                token, meta = chunk
+                if hasattr(token, "content") and token.content:
+                    yield {"event": "token", "data": token.content}
             except Exception:
-                # fallback: just dump whatever arrived (useful for debugging)
-                yield {"event": "debug", "data": json.dumps(chunk, default=str)}
-
-        # Also send final answer via a non-stream call (optional, but handy)
-        final = graph.invoke(inputs)
-        yield {"event": "final", "data": final.get("answer", "")}
+                pass
 
     return EventSourceResponse(event_gen())
