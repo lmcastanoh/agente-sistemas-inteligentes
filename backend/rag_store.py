@@ -41,6 +41,32 @@ def _obtener_lector_ocr() -> easyocr.Reader:
     return _lector_ocr
 
 
+def _inferir_modelo(ruta_pdf: Path) -> str:
+    """Deriva un nombre de modelo legible a partir del nombre del archivo PDF."""
+    nombre = ruta_pdf.stem.lower()
+
+    # Eliminar prefijos comunes de fichas técnicas
+    for prefijo in [
+        "ficha-tecnica-", "ficha_tecnica_", "fichatecnica_",
+        "ftlandcruiser-", "ft-", "ft_", "ficha-",
+    ]:
+        if nombre.startswith(prefijo):
+            nombre = nombre[len(prefijo):]
+            break
+
+    # Eliminar sufijos de versión y fecha: -v2-26, -v-09-25, -my2025, _202511
+    nombre = re.sub(r"[-_](v[-_]?\d+[-_]?\d*|my\d+|20\d{2,4}.*)", "", nombre)
+
+    # Eliminar sufijos de procesamiento
+    nombre = re.sub(r"[-_](compressed|copy\d*|vf|pa|ipm\d+)$", "", nombre)
+
+    # Reemplazar separadores por espacios y capitalizar cada palabra
+    nombre = nombre.replace("-", " ").replace("_", " ")
+    nombre = " ".join(word.capitalize() for word in nombre.split())
+
+    return nombre if nombre else ruta_pdf.stem
+
+
 def _limpiar_texto(texto: str) -> str:
     texto = re.sub(r"[^\S\n]+", " ", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto)
@@ -76,7 +102,12 @@ def _extraer_paginas_pdf(ruta_pdf: Path) -> List[Document]:
                     documentos.append(
                         Document(
                             page_content=texto_limpio,
-                            metadata={"source": ruta_pdf.name, "page": i + 1},
+                            metadata={
+                                "source": ruta_pdf.name,
+                                "page":   i + 1,
+                                "marca":  ruta_pdf.parent.name,
+                                "modelo": _inferir_modelo(ruta_pdf),
+                            },
                         )
                     )
     except Exception as e:
