@@ -36,11 +36,13 @@ if go and q.strip():
         timeout=300,
         headers={"Accept": "text/event-stream"},
     ) as r:
+        current_event = None
         for line in r.iter_lines(decode_unicode=True):
             if not line:
+                current_event = None
                 continue
-            # SSE lines look like: "event: token" and "data: ...."
-            if line.startswith("data: "):
-                data = line[len("data: "):]
-                full += data
+            if line.startswith("event: "):
+                current_event = line[len("event: "):]
+            elif line.startswith("data: ") and current_event == "token":
+                full += line[len("data: "):]
                 placeholder.markdown(full)

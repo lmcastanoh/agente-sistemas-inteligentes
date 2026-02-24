@@ -2,8 +2,15 @@
 from __future__ import annotations
 
 import os
+import re
+import logging
 from pathlib import Path
 from typing import List
+
+import pdfplumber
+import easyocr
+from PIL import Image
+import numpy as np
 
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
@@ -11,10 +18,71 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import TextLoader
+
+logger = logging.getLogger(__name__)
 
 PERSIST_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 COLLECTION = os.getenv("CHROMA_COLLECTION", "rag_collection")
+
+# Mínimo de caracteres para considerar que una página tiene texto nativo
+MIN_CHARS_PARA_TEXTO = 50
+
+# Lector OCR compartido — se inicializa una sola vez
+_lector_ocr: easyocr.Reader | None = None
+
+
+def _obtener_lector_ocr() -> easyocr.Reader:
+    global _lector_ocr
+    if _lector_ocr is None:
+        logger.info("Inicializando EasyOCR (primera vez descarga modelos ~100 MB)...")
+        _lector_ocr = easyocr.Reader(["es", "en"], gpu=False, verbose=False)
+        logger.info("EasyOCR listo.")
+    return _lector_ocr
+
+
+def _limpiar_texto(texto: str) -> str:
+    texto = re.sub(r"[^\S\n]+", " ", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    texto = re.sub(r"^[\s\-_\.]{3,}$", "", texto, flags=re.MULTILINE)
+    return texto.strip()
+
+
+def _extraer_paginas_pdf(ruta_pdf: Path) -> List[Document]:
+    """
+    Extrae texto de cada página del PDF.
+    - Páginas con texto nativo: pdfplumber directo.
+    - Páginas escaneadas (imagen): EasyOCR.
+    Retorna una lista de Documents con metadatos source + page.
+    """
+    documentos: List[Document] = []
+
+    try:
+        with pdfplumber.open(ruta_pdf) as pdf:
+            for i, pagina in enumerate(pdf.pages):
+                texto_nativo = pagina.extract_text() or ""
+
+                if len(texto_nativo.strip()) >= MIN_CHARS_PARA_TEXTO:
+                    texto = texto_nativo
+                else:
+                    logger.info(f"  OCR página {i + 1}: {ruta_pdf.name}")
+                    imagen: Image.Image = pagina.to_image(resolution=200).original
+                    lector = _obtener_lector_ocr()
+                    resultados = lector.readtext(np.array(imagen), detail=0, paragraph=True)
+                    texto = "\n".join(resultados)
+
+                texto_limpio = _limpiar_texto(texto)
+                if texto_limpio:
+                    documentos.append(
+                        Document(
+                            page_content=texto_limpio,
+                            metadata={"source": ruta_pdf.name, "page": i + 1},
+                        )
+                    )
+    except Exception as e:
+        logger.error(f"Error procesando {ruta_pdf.name}: {e}")
+
+    return documentos
 
 """def get_vector_store() -> Chroma:
     embeddings = OpenAIEmbeddings(model=os.getenv("EMBED_MODEL", "text-embedding-3-small"))
@@ -43,16 +111,15 @@ def load_files(data_dir: str) -> List[Document]:
 
     docs: List[Document] = []
 
-    # PDFs
-    for fp in p.rglob("*.pdf"):
-        loader = PyPDFLoader(str(fp))
-        docs.extend(loader.load())
+    pdfs = sorted(p.rglob("*.pdf"))
+    logger.info(f"PDFs encontrados: {len(pdfs)} en {p.resolve()}")
+    for fp in pdfs:
+        logger.info(f"Procesando: {fp.name}")
+        docs.extend(_extraer_paginas_pdf(fp))
 
-    # (Opcional) TXT también
     for fp in p.rglob("*.txt"):
         docs.extend(TextLoader(str(fp), encoding="utf-8").load())
-    print("DATA DIR:", p.resolve())
-    print("PDFs found:", len(list(p.rglob("*.pdf"))))
+
     return docs
 
 def ingest(data_dir: str) -> dict:
