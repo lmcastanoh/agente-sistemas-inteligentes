@@ -6,6 +6,8 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 
+from langchain_core.messages import ToolMessage
+
 from rag_graph import build_rag_graph
 from rag_store import ingest
 
@@ -42,7 +44,9 @@ async def chat_stream(req: ChatRequest):
         async for chunk in graph.astream(inputs, stream_mode="messages"):
             try:
                 token, meta = chunk
-                if hasattr(token, "content") and token.content:
+                if (hasattr(token, "content") and token.content
+                        and not isinstance(token, ToolMessage)
+                        and not getattr(token, "tool_calls", None)):
                     yield {"event": "token", "data": token.content}
             except Exception:
                 pass
