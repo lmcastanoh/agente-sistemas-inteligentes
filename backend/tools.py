@@ -120,17 +120,24 @@ def comparar_modelos(modelo1: str, modelo2: str) -> str:
 
     if not ctx1 and not ctx2:
         return f"No se encontró información para '{modelo1}' ni '{modelo2}'."
+    prompt = f"""Eres un experto en fichas tecnicas de vehiculos.
+Con base UNICAMENTE en la informacion proporcionada, genera una comparativa clara
+en markdown entre **{modelo1}** y **{modelo2}**.
 
-    prompt = (
-        f"Eres un experto en fichas técnicas de vehículos. "
-        f"Con base ÚNICAMENTE en la información proporcionada, genera una tabla comparativa "
-        f"en markdown entre **{modelo1}** y **{modelo2}**.\n\n"
-        f"Incluye filas para: Motor, Potencia, Torque, Transmisión, Tracción, "
-        f"Dimensiones, Peso, Consumo, y cualquier otro dato relevante disponible.\n"
-        f"Si un dato no está en la información, escribe N/D.\n\n"
-        f"### Información de {modelo1}:\n{ctx1}\n\n"
-        f"### Información de {modelo2}:\n{ctx2}"
-    )
+Reglas de formato:
+- Si hay datos comparables, usa una tabla markdown limpia.
+- Incluye solo filas con informacion real para al menos uno de los modelos.
+- No llenes la tabla con N/D masivo.
+- Si faltan demasiados datos para comparar, NO hagas tabla: responde en 2-4 bullets
+  explicando que no hay informacion suficiente y que datos faltan.
+- Cierra con una recomendacion corta (1-2 lineas) solo si hay sustento en los datos.
+
+### Informacion de {modelo1}:
+{ctx1}
+
+### Informacion de {modelo2}:
+{ctx2}
+"""
 
     response = _get_llm().invoke(prompt)
     return str(response.content)
@@ -153,19 +160,25 @@ def resumir_ficha(modelo: str) -> str:
         return f"No se encontró información para el modelo '{modelo}'."
 
     ctx = "\n\n".join(d.page_content for d in docs)
+    prompt = f"""Eres un experto en fichas tecnicas de vehiculos.
+Con base UNICAMENTE en la siguiente informacion, genera un resumen estructurado
+en markdown del **{modelo}**.
 
-    prompt = (
-        f"Eres un experto en fichas técnicas de vehículos. "
-        f"Con base ÚNICAMENTE en la siguiente información, genera un resumen estructurado "
-        f"en markdown del **{modelo}**.\n\n"
-        f"Organiza el resumen en estas secciones (omite las que no tengan datos):\n"
-        f"- Motor y Transmisión\n"
-        f"- Rendimiento y Consumo\n"
-        f"- Dimensiones y Capacidades\n"
-        f"- Equipamiento destacado\n"
-        f"- Versiones disponibles\n\n"
-        f"### Información disponible:\n{ctx}"
-    )
+Reglas de formato:
+- Usa titulo y secciones cortas, faciles de leer.
+- Organiza en estas secciones y omite las que no tengan datos:
+  - Motor y transmision
+  - Rendimiento y consumo
+  - Dimensiones y capacidades
+  - Equipamiento destacado
+  - Versiones disponibles
+- No repitas frases de disculpa.
+- Si hay pocos datos, usa una seccion final 'Datos faltantes' con bullets.
+- Evita tablas enormes con N/D.
+
+### Informacion disponible:
+{ctx}
+"""
 
     response = _get_llm().invoke(prompt)
     return str(response.content)
