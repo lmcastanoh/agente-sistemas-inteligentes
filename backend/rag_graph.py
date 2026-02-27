@@ -4,7 +4,7 @@ import json
 from typing import Annotated, Any, List, Optional, TypedDict
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -29,7 +29,6 @@ from tools import (
     resumir_ficha,
 )
 
-MAX_RETRIES = 2
 K_POR_INTENCION = {
     "comparación": 10,
     "resumen": 8,
@@ -55,7 +54,7 @@ class RAGState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     intent: Optional[dict[str, Any]]
     eval_result: Optional[dict[str, Any]]
-    retries: int
+    usar_tools: bool
     trazabilidad: dict[str, Any]
 
 
@@ -147,7 +146,7 @@ def build_rag_graph():
             "ruta_seleccionada": "rag" if intent_data["needs_retrieval"] else "general",
             "motivo": intent_data["reason"],
         }
-        return {"intent": intent_data, "retries": 0, "trazabilidad": traza}
+        return {"intent": intent_data, "trazabilidad": traza}
 
     def decide_tools(state: RAGState) -> dict[str, Any]:
         """
@@ -249,27 +248,6 @@ def build_rag_graph():
         traza["chunks_recuperados"] = _retrieved_chunk_payload(docs)
         return {"docs": docs, "trazabilidad": traza}
 
-    def pre_tools_planner(state: RAGState) -> dict[str, Any]:
-        question = state["question"]
-        tool_response = tool_node.invoke({"question": question})
-        tool_text = ""
-        if hasattr(tool_response, "content"):
-            tool_text = tool_response.content
-        else:
-            tool_text = str(tool_response)
-
-        traza = dict(state.get("trazabilidad") or {})
-        traza["ruta"] = traza.get("ruta", []) + ["pre_tools_planner"]
-        traza["tools_output"] = tool_text
-
-        tool_message = ToolMessage(content=tool_text, tool_name="tools")
-        messages = state.get("messages", []) + [tool_message]
-        return {
-            "messages": messages,
-            "trazabilidad": traza,
-            "origen_respuesta": state.get("origen_respuesta", "generate_grounded"),
-        }
-
     def generate_grounded(state: RAGState) -> dict[str, Any]:
         docs = state.get("docs", [])
         context = _retrieval_context(docs)
@@ -329,7 +307,6 @@ def build_rag_graph():
         docs = state.get("docs", [])
         answer = state.get("answer", "")
         question = state["question"]
-        retries = int(state.get("retries", 0))
 
         retrieved_chunks_json = json.dumps(_retrieved_chunk_payload(docs), ensure_ascii=False)
         structured = critic_llm.with_structured_output(GroundingEvaluation)
@@ -357,98 +334,49 @@ def build_rag_graph():
             "suficiente": eval_data.get("complete_enough"),
             "issues": eval_data.get("issues", []),
             "pregunta_aclaracion": eval_data.get("clarification_question"),
-            "reintentos": retries,
         }
+        return {"eval_result": eval_data, "trazabilidad": traza}
 
-        next_retries = retries + (0 if eval_data.get("approved") else 1)
-        return {"eval_result": eval_data, "retries": next_retries, "trazabilidad": traza}
-
-    def ask_clarification(state: RAGState) -> dict[str, Any]:
-        intent = state.get("intent") or {}
-        eval_result = state.get("eval_result") or {}
-        clarification = (
-            intent.get("clarification_question")
-            or eval_result.get("clarification_question")
-            or "¿Podrías especificar marca, modelo, año y versión?"
-        )
-        answer = f"Necesito una aclaración para responder con confiabilidad: {clarification}"
-
-        traza = dict(state.get("trazabilidad") or {})
-        traza["ruta"] = traza.get("ruta", []) + ["ask_clarification"]
-        return {"answer": answer, "messages": [AIMessage(content=answer)], "trazabilidad": traza}
+    # ── Routing functions ──────────────────────────────────────────
 
     def route_after_classify(state: RAGState) -> str:
         intent = state.get("intent") or {}
         if intent.get("needs_retrieval", True):
-            return "decide_tools"
+            return "retrieve"
         return "answer_general"
 
-    def route_after_retrieve(state: RAGState) -> str:
+    def route_after_decide_tools(state: RAGState) -> str:
         if state.get("usar_tools", False):
-            return "pre_tools_planner"
-        return "generate_grounded"
-
-    def route_after_pre_tools_planner(state: RAGState) -> str:
-        last = (state.get("messages") or [None])[-1]
-        if isinstance(last, AIMessage) and last.tool_calls:
             return "tools"
         return "generate_grounded"
 
-    def route_after_tools(state: RAGState) -> str:
-        return "generate_grounded"
-
-    def route_after_eval(state: RAGState) -> str:
-        eval_result = state.get("eval_result") or {}
-        retries = int(state.get("retries", 0))
-        intent = state.get("intent") or {}
-
-        if eval_result.get("approved"):
-            return END
-        if retries <= MAX_RETRIES:
-            return "generate_grounded"
-        if intent.get("clarification_question"):
-            return "ask_clarification"
-        if eval_result.get("clarification_question"):
-            return "ask_clarification"
-        return END
+    # ── Graph assembly ─────────────────────────────────────────────
 
     graph = (
         StateGraph(RAGState)
         .add_node("classify_intent", classify_intent)
-        .add_node("decide_tools", decide_tools)
         .add_node("answer_general", answer_general)
         .add_node("retrieve", retrieve)
-        .add_node("pre_tools_planner", pre_tools_planner)
-        .add_node("generate_grounded", generate_grounded)
+        .add_node("decide_tools", decide_tools)
         .add_node("tools", tool_node)
+        .add_node("generate_grounded", generate_grounded)
         .add_node("evaluate_grounding", evaluate_grounding)
-        .add_node("ask_clarification", ask_clarification)
         .add_edge(START, "classify_intent")
         .add_conditional_edges(
             "classify_intent",
             route_after_classify,
-            {"decide_tools": "decide_tools", "answer_general": "answer_general"},
+            {"retrieve": "retrieve", "answer_general": "answer_general"},
         )
-        .add_edge("decide_tools", "retrieve")
-        .add_conditional_edges("retrieve", route_after_retrieve, {"pre_tools_planner": "pre_tools_planner", "generate_grounded": "generate_grounded"})
-        .add_conditional_edges("pre_tools_planner", route_after_pre_tools_planner, {"tools": "tools", "generate_grounded": "generate_grounded"})
         .add_edge("answer_general", END)
+        .add_edge("retrieve", "decide_tools")
         .add_conditional_edges(
-            "tools",
-            route_after_tools,
-            {"generate_grounded": "generate_grounded"},
+            "decide_tools",
+            route_after_decide_tools,
+            {"tools": "tools", "generate_grounded": "generate_grounded"},
         )
+        .add_edge("tools", "generate_grounded")
         .add_edge("generate_grounded", "evaluate_grounding")
-        .add_conditional_edges(
-            "evaluate_grounding",
-            route_after_eval,
-            {
-                "generate_grounded": "generate_grounded",
-                "ask_clarification": "ask_clarification",
-                END: END,
-            },
-        )
-        .add_edge("ask_clarification", END)
+        .add_edge("evaluate_grounding", END)
         .compile(checkpointer=MemorySaver())
     )
     print(graph.get_graph().draw_ascii())
