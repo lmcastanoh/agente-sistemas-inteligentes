@@ -9,49 +9,19 @@ API_BASE = "http://localhost:8001"
 
 
 def _clean_markdown(text: str) -> str:
-    """Normalize imperfect streamed markdown into readable UI content."""
     if not text:
         return ""
 
     out = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Convert markdown headings to normal text to avoid giant rendering.
     out = re.sub(r"(?m)^\s*#{1,6}\s*(.+)$", r"\1", out)
     out = re.sub(r"(?m)^(\S+?)##\s*", r"\1\n", out)
-
-    # Break common glued bullet patterns.
     out = out.replace(".-", ".\n- ")
     out = re.sub(r"(?<!\n)-\s+", "\n- ", out)
-
-    # Add line breaks before common section labels if they are glued together.
-    labels = [
-        "Motor y transmision:",
-        "Rendimiento y consumo:",
-        "Dimensiones y capacidades:",
-        "Equipamiento destacado:",
-        "Versiones disponibles:",
-        "Datos faltantes:",
-    ]
-    for label in labels:
-        out = re.sub(
-            rf"(?i)(?<!\n)({re.escape(label)})",
-            r"\n**\1**",
-            out,
-        )
-
-    # Convert section-like labels into bullets for compact reading.
-    out = re.sub(
-        r"(?im)^\s*(motor y transmision|rendimiento y consumo|dimensiones y capacidades|equipamiento destacado|versiones disponibles|datos faltantes)\s*:\s*",
-        r"- **\1:** ",
-        out,
-    )
-
-    # Normalize excessive spacing.
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
 
 
-st.set_page_config(page_title="RAG Cars", layout="wide")
+st.set_page_config(page_title="RAG Autos", layout="wide")
 
 st.markdown(
     """
@@ -66,33 +36,18 @@ st.markdown(
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #1f2430 0%, #1a1f2a 100%);
     }
-    [data-testid="stChatMessage"] h1,
-    [data-testid="stChatMessage"] h2,
-    [data-testid="stChatMessage"] h3,
-    [data-testid="stChatMessage"] h4,
-    [data-testid="stChatMessage"] h5,
-    [data-testid="stChatMessage"] h6 {
-        font-size: 1.1rem !important;
-        line-height: 1.45 !important;
-        margin: 0.25rem 0 !important;
-        font-weight: 700 !important;
-    }
     [data-testid="stChatMessage"] p,
     [data-testid="stChatMessage"] li {
         font-size: 1rem !important;
         line-height: 1.55 !important;
-    }
-    [data-testid="stChatMessage"] ul {
-        margin-top: 0.25rem;
-        margin-bottom: 0.5rem;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("RAG Cars Assistant")
-st.caption("Preguntas sobre fichas tecnicas, comparaciones y recomendaciones.")
+st.title("RAG Autos")
+st.caption("Preguntas sobre fichas técnicas, comparaciones y recomendaciones.")
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -100,16 +55,16 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 with st.sidebar:
-    st.subheader("Session")
+    st.subheader("Sesión")
     st.caption(f"session_id: {st.session_state.session_id}")
-    if st.button("New session", use_container_width=True):
+    if st.button("Nueva sesión", use_container_width=True):
         st.session_state.session_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
 
-    st.subheader("Ingest documents")
-    data_dir = st.text_input("Data directory", value="./data")
-    if st.button("Ingest", use_container_width=True):
+    st.subheader("Ingesta de documentos")
+    data_dir = st.text_input("Directorio de datos", value="./data")
+    if st.button("Ingestar", use_container_width=True):
         try:
             r = requests.post(
                 f"{API_BASE}/ingest",
@@ -117,18 +72,18 @@ with st.sidebar:
                 timeout=300,
             )
             if r.headers.get("content-type", "").startswith("application/json"):
-                st.success("Ingest completed")
+                st.success("Ingesta completada")
                 st.json(r.json())
             else:
-                st.error(f"Backend error ({r.status_code}): {r.text}")
+                st.error(f"Error backend ({r.status_code}): {r.text}")
         except Exception as exc:
-            st.error(f"Ingest request failed: {exc}")
+            st.error(f"Fallo en ingesta: {exc}")
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-prompt = st.chat_input("Ask about cars...")
+prompt = st.chat_input("Pregunta sobre autos...")
 
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -149,7 +104,7 @@ if prompt:
                 headers={"Accept": "text/event-stream"},
             ) as r:
                 if r.status_code != 200:
-                    final_text = f"Backend error ({r.status_code}): {r.text}"
+                    final_text = f"Error backend ({r.status_code}): {r.text}"
                     placeholder.error(final_text)
                 else:
                     current_event = None
@@ -158,9 +113,9 @@ if prompt:
                             current_event = None
                             continue
                         if line.startswith("event: "):
-                            current_event = line[len("event: "):]
+                            current_event = line[len("event: ") :]
                         elif line.startswith("data: "):
-                            data = line[len("data: "):]
+                            data = line[len("data: ") :]
                             if current_event == "token":
                                 raw += data
                                 placeholder.markdown(_clean_markdown(raw))
@@ -172,50 +127,56 @@ if prompt:
                             elif current_event == "done":
                                 break
 
-                    final_text = _clean_markdown(raw) if raw.strip() else "No response generated."
+                    final_text = _clean_markdown(raw) if raw.strip() else "No se generó respuesta."
                     placeholder.markdown(final_text)
         except Exception as exc:
-            final_text = f"Request failed: {exc}"
+            final_text = f"Fallo de request: {exc}"
             placeholder.error(final_text)
 
         if trazabilidad_data:
             with st.expander("🔍 Trazabilidad de la respuesta"):
-                ruta = trazabilidad_data.get("ruta", [])
-                st.markdown(f"**Ruta del grafo:** `{' → '.join(ruta)}`")
+                ruta = trazabilidad_data.get("ruta") or trazabilidad_data.get("route") or []
+                ruta_str = " -> ".join(ruta) if ruta else "Sin ruta disponible"
+                st.markdown(f"**Ruta del grafo:** `{ruta_str}`")
 
-                cls = trazabilidad_data.get("clasificacion", {})
+                cls = trazabilidad_data.get("clasificacion") or trazabilidad_data.get("intent_json") or {}
                 if cls:
                     st.markdown(
-                        f"**Intención:** `{cls.get('intencion')}` &nbsp;|&nbsp; "
-                        f"**Requiere RAG:** `{cls.get('requiere_rag')}`"
+                        f"**Intención:** `{cls.get('intent', cls.get('intencion'))}` "
+                        f"&nbsp;|&nbsp; **Requiere RAG:** `{cls.get('needs_retrieval', cls.get('requiere_rag'))}`"
                     )
-                    if cls.get("marcas_mencionadas"):
-                        st.markdown(f"**Marcas:** {', '.join(cls['marcas_mencionadas'])}")
-                    if cls.get("modelos_mencionados"):
-                        st.markdown(f"**Modelos:** {', '.join(cls['modelos_mencionados'])}")
+                    entidades = cls.get("entities", {})
+                    if entidades:
+                        st.markdown(
+                            f"**Entidades:** Marca={entidades.get('make')} | Modelo={entidades.get('model')} | "
+                            f"Año={entidades.get('year')}"
+                        )
+                    if cls.get("clarification_question"):
+                        st.markdown(f"**Pregunta de aclaración:** {cls.get('clarification_question')}")
 
-                chunks = trazabilidad_data.get("chunks_recuperados", [])
+                chunks = trazabilidad_data.get("chunks_recuperados") or trazabilidad_data.get("retrieved_chunks") or []
                 if chunks:
-                    k = trazabilidad_data.get("k_utilizado", "-")
+                    k = trazabilidad_data.get("k_utilizado", trazabilidad_data.get("retrieval_k", "-"))
                     st.markdown(f"**Chunks recuperados:** {len(chunks)} (k={k})")
                     rows = [
-                        f"- `{c.get('source','')}` p.{c.get('page','')} "
-                        f"| {c.get('marca','')} — {c.get('modelo','')}"
+                        f"- `{c.get('source', '')}` p.{c.get('page', '')} "
                         for c in chunks
                     ]
                     st.markdown("\n".join(rows))
 
-                ver = trazabilidad_data.get("verificacion", {})
+                ver = trazabilidad_data.get("verificacion") or trazabilidad_data.get("evaluation_result") or {}
                 if ver:
-                    aprobada = ver.get("aprobada")
+                    aprobada = ver.get("aprobada", ver.get("approved"))
+                    puntuacion = ver.get("puntuacion", ver.get("score", 0))
                     icono = "✅" if aprobada else "❌"
-                    puntuacion = ver.get("puntuacion", 0)
                     st.markdown(
                         f"**Verificación:** {icono} {'Aprobada' if aprobada else 'Rechazada'} "
                         f"&nbsp;|&nbsp; Puntuación: `{puntuacion:.2f}` "
                         f"&nbsp;|&nbsp; Reintentos: `{ver.get('reintentos', 0)}`"
                     )
-                    if ver.get("motivo_rechazo"):
-                        st.markdown(f"**Motivo de rechazo:** {ver['motivo_rechazo']}")
+                    issues = ver.get("issues", [])
+                    if issues:
+                        st.markdown("**Issues:**")
+                        st.markdown("\n".join([f"- {x}" for x in issues]))
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
