@@ -51,6 +51,7 @@ async def chat_stream(req: ChatRequest):
             "docs": [],
             "answer": "",
             "messages": [HumanMessage(content=req.question)],
+            "usar_tools": False,
         }
         config = {"configurable": {"thread_id": req.session_id}}
 
@@ -60,8 +61,8 @@ async def chat_stream(req: ChatRequest):
             answer = final.get("answer", "")
             if isinstance(answer, str) and answer.strip():
                 yield {"event": "token", "data": answer}
-        except Exception:
-            pass
+        except Exception as exc:
+            yield {"event": "token", "data": f"Error interno: {exc}"}
 
         # Emit trazabilidad from final graph state
         try:

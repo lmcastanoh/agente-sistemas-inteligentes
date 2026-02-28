@@ -18,6 +18,7 @@ class IntentClassification(BaseModel):
     reason: str = Field(min_length=1, max_length=240)
     entities: IntentEntities
     clarification_question: Optional[str] = None
+    suggested_k: Optional[int] = Field(default=None, ge=1, le=20)
 
 
 class GroundingEvaluation(BaseModel):
