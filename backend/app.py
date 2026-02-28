@@ -1,4 +1,14 @@
 # backend/app.py
+# ==============================================================================
+# API FastAPI para el sistema RAG de fichas tecnicas vehiculares.
+#
+# Endpoints:
+#   POST /ingest       — Ingesta PDFs desde un directorio a ChromaDB
+#   POST /chat/stream  — Chat con streaming SSE (Server-Sent Events)
+#
+# El grafo LangGraph se construye una sola vez al iniciar la aplicacion.
+# Cada sesion de chat se identifica por session_id para mantener historial.
+# ==============================================================================
 from __future__ import annotations
 
 import json
@@ -14,38 +24,72 @@ from sse_starlette.sse import EventSourceResponse
 from rag_graph import build_rag_graph
 from rag_store import ingest
 
-# Load .env from project root (two levels up), not from inside backend/
+# Cargar .env desde la raiz del proyecto (dos niveles arriba de backend/)
 env_path = Path(__file__).resolve().parents[2] / ".env"
 load_dotenv(dotenv_path=env_path)
 
 app = FastAPI(title="LangGraph RAG API")
 
+# Construir el grafo LangGraph una sola vez al arrancar.
+# Incluye: vector store, LLMs, tools, nodos y edges del grafo.
 graph = build_rag_graph()
 
 
 class ChatRequest(BaseModel):
+    """Modelo de request para el endpoint de chat.
+
+    Campos:
+        question:   Pregunta del usuario en lenguaje natural.
+        session_id: Identificador de sesion para mantener historial conversacional.
+                    Permite follow-ups como "y cuanto pesa?" heredando el modelo previo.
+    """
+
     question: str
     session_id: str = "default"
 
 
 class IngestRequest(BaseModel):
+    """Modelo de request para el endpoint de ingestion.
+
+    Campos:
+        data_dir: Ruta al directorio con PDFs organizados por marca.
+                  Ejemplo: "./data" (relativo a backend/)
+    """
+
     data_dir: str
 
 
 @app.post("/ingest")
 def ingest_route(req: IngestRequest):
+    """Ingesta documentos PDF a ChromaDB.
+
+    Proceso:
+    1. Lee PDFs del directorio indicado (texto nativo o OCR)
+    2. Divide en chunks (1000 chars, 150 overlap)
+    3. Genera embeddings con all-MiniLM-L6-v2
+    4. Almacena en ChromaDB con metadata (source, page, marca, modelo, doc_id, chunk_id)
+
+    Retorna: cantidad de documentos, chunks e IDs agregados.
+    """
     result = ingest(req.data_dir)
     return JSONResponse(result)
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """
-    Streams only the final answer to avoid duplicated text when the graph retries
-    grounded generation internally.
+    """Chat con streaming SSE.
+
+    Ejecuta el grafo RAG completo y emite 3 tipos de eventos SSE:
+    - "token":         Respuesta final del RAG (texto)
+    - "trazabilidad":  JSON con ruta completa, decisiones, chunks, evaluacion
+    - "done":          Senial de fin del stream
+
+    Nota: emite solo la respuesta final (no tokens intermedios) para evitar
+    texto duplicado cuando el grafo reintenta la generacion internamente.
     """
 
     async def event_gen():
+        # Estado inicial del grafo: pregunta, listas vacias, flags en false
         inputs = {
             "question": req.question,
             "docs": [],
@@ -53,9 +97,10 @@ async def chat_stream(req: ChatRequest):
             "messages": [HumanMessage(content=req.question)],
             "usar_tools": False,
         }
+        # thread_id vincula esta invocacion a una sesion persistente (MemorySaver)
         config = {"configurable": {"thread_id": req.session_id}}
 
-        # Run graph to completion, then emit only final answer.
+        # Ejecutar el grafo completo y emitir solo la respuesta final
         try:
             final = await graph.ainvoke(inputs, config=config)
             answer = final.get("answer", "")
@@ -64,7 +109,7 @@ async def chat_stream(req: ChatRequest):
         except Exception as exc:
             yield {"event": "token", "data": f"Error interno: {exc}"}
 
-        # Emit trazabilidad from final graph state
+        # Emitir trazabilidad desde el estado final del grafo
         try:
             final_state = await graph.aget_state(config)
             traza = final_state.values.get("trazabilidad", {})

@@ -1,6 +1,29 @@
+# backend/prompts.py
+# ==============================================================================
+# System prompts y templates para los LLMs del grafo RAG.
+#
+# Contiene 3 pares (system + user template):
+# 1. CLASSIFIER  — clasificador de intencion (nodo classify_intent)
+# 2. GROUNDED_GENERATION — generador con grounding (nodo generate_grounded)
+# 3. GROUNDING_CRITIC — critico evaluador (nodo evaluate_grounding)
+# ==============================================================================
 from __future__ import annotations
 
 
+# ==============================================================================
+# CLASIFICADOR DE INTENCION
+# Usado en: classify_intent (rag_graph.py)
+# LLM: gpt-5-nano (temperature=0)
+# Salida: IntentClassification (schemas.py)
+#
+# Clasifica la consulta del usuario en 4 categorias:
+# - Busqueda:    dato tecnico puntual (potencia, torque, dimensiones)
+# - Resumen:     ficha completa / overview de un vehiculo
+# - Comparacion: comparar dos o mas vehiculos
+# - GENERAL:     conocimiento automotriz que no depende del corpus
+#
+# Tambien sugiere suggested_k (cuantos chunks recuperar de ChromaDB).
+# ==============================================================================
 CLASSIFIER_SYSTEM_PROMPT = """Eres un clasificador de intención para un asistente de fichas técnicas vehiculares.
 
 Clasifica la consulta en UNA sola categoría:
@@ -38,11 +61,25 @@ Devuelve SOLO JSON válido con este esquema exacto:
 """
 
 
+# Template del mensaje del usuario para el clasificador.
+# Se inyecta la pregunta (y opcionalmente el historial conversacional).
 CLASSIFIER_USER_TEMPLATE = """Consulta del usuario:
 {question}
 """
 
 
+# ==============================================================================
+# GENERADOR CON GROUNDING
+# Usado en: generate_grounded (rag_graph.py)
+# LLM: gpt-5-nano (temperature=0.2) con tools bindeadas
+#
+# Genera la respuesta final basada UNICAMENTE en el contexto recuperado.
+# Reglas estrictas anti-hallucination:
+# - No usar conocimiento externo
+# - Citar cada afirmacion con [doc_id=<valor>; pagina=<valor>]
+# - Declarar explicitamente datos faltantes
+# - No inventar fichas tecnicas
+# ==============================================================================
 GROUNDED_GENERATION_SYSTEM_PROMPT = """Eres un asistente con grounding para fichas técnicas vehiculares.
 
 Debes responder SOLO con información presente en el contexto recuperado.
@@ -63,6 +100,9 @@ Reglas:
 """
 
 
+# Template del mensaje del usuario para generacion grounded.
+# Recibe la pregunta original y el contexto combinado (chunks + output de tools).
+# Si es un reintento, se adjunta la seccion === CORRECCION REQUERIDA === al final.
 GROUNDED_GENERATION_USER_TEMPLATE = """Pregunta:
 {question}
 
@@ -71,6 +111,19 @@ Contexto recuperado:
 """
 
 
+# ==============================================================================
+# CRITICO DE GROUNDING
+# Usado en: evaluate_grounding (rag_graph.py)
+# LLM: gpt-5-nano (temperature=0)
+# Salida: GroundingEvaluation (schemas.py)
+#
+# Evalua la respuesta generada contra 3 criterios:
+# 1. Soportada unicamente por el contexto recuperado
+# 2. Incluye citas en formato correcto
+# 3. Suficientemente completa para la pregunta
+#
+# Si score < 0.5: puede disparar regeneration loop (max 1 reintento)
+# ==============================================================================
 GROUNDING_CRITIC_SYSTEM_PROMPT = """Eres un crítico estricto de grounding.
 
 Evalúa si la respuesta:
@@ -91,6 +144,8 @@ Devuelve SOLO JSON válido con este esquema:
 """
 
 
+# Template del mensaje del usuario para el critico.
+# Recibe la pregunta, los chunks recuperados (JSON) y la respuesta a evaluar.
 GROUNDING_CRITIC_USER_TEMPLATE = """Pregunta:
 {question}
 

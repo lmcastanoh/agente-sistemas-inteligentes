@@ -1,4 +1,18 @@
 # backend/tools.py
+# ==============================================================================
+# Tools de LangGraph para el sistema RAG de fichas tecnicas vehiculares.
+#
+# Estas tools son invocadas por el LLM en el nodo call_tools cuando el flujo
+# pasa por Comparacion o Resumen. El ToolNode de LangGraph las ejecuta
+# automaticamente a partir de los tool_calls generados por el LLM.
+#
+# Tools disponibles:
+#   - listar_modelos_disponibles: catalogo de modelos indexados
+#   - buscar_especificacion:      dato tecnico puntual de un modelo
+#   - buscar_por_marca:           todos los modelos de una marca
+#   - comparar_modelos:           tabla comparativa entre 2 modelos
+#   - resumir_ficha:              resumen estructurado de un modelo
+# ==============================================================================
 from __future__ import annotations
 
 from langchain_core.tools import tool
@@ -8,18 +22,28 @@ from rag_store import get_vector_store
 
 
 def _get_llm():
+    """Retorna instancia de LLM para generacion dentro de tools (comparar, resumir).
+
+    Usa gpt-5-nano con temperature=0 para respuestas consistentes y deterministas.
+    """
     return ChatOpenAI(model="gpt-5-nano", temperature=0)
 
 
 @tool
 def listar_modelos_disponibles(marca: str = "") -> str:
-    """
-    Retorna el catálogo de modelos indexados en la base de conocimiento.
+    """Retorna el catalogo de modelos indexados en la base de conocimiento.
+
+    Consulta directamente la coleccion ChromaDB (sin similarity search)
+    para listar todos los modelos unicos agrupados por marca.
     Si se indica una marca, filtra solo los modelos de esa marca.
-    Usa esta tool cuando el usuario pregunte qué modelos o vehículos están disponibles.
+
+    Usada cuando el usuario pregunta que modelos o vehiculos estan disponibles.
 
     Args:
         marca: Nombre de la marca a filtrar (ej: 'Toyota', 'Mazda'). Opcional.
+
+    Returns:
+        Lista formateada de modelos por marca, o mensaje si no hay resultados.
     """
     vs = get_vector_store()
 
@@ -45,14 +69,20 @@ def listar_modelos_disponibles(marca: str = "") -> str:
 
 @tool
 def buscar_especificacion(especificacion: str, modelo: str) -> str:
-    """
-    Busca un dato técnico puntual (potencia, torque, autonomía, consumo, dimensiones, etc.)
-    para un modelo específico.
-    Usa esta tool cuando el usuario pregunte por una característica técnica concreta de un vehículo.
+    """Busca un dato tecnico puntual para un modelo especifico.
+
+    Realiza similarity search combinando la especificacion y el modelo
+    para encontrar los chunks mas relevantes (k=6).
+
+    Usada cuando el usuario pregunta por una caracteristica tecnica concreta
+    como potencia, torque, autonomia, consumo o dimensiones.
 
     Args:
-        especificacion: El dato técnico buscado (ej: 'potencia', 'torque', 'autonomía').
-        modelo: El nombre del modelo del vehículo (ej: 'Hilux', 'CX-5').
+        especificacion: El dato tecnico buscado (ej: 'potencia', 'torque', 'autonomia').
+        modelo:         El nombre del modelo del vehiculo (ej: 'Hilux', 'CX-5').
+
+    Returns:
+        Fragmentos de contexto con metadata [source, pagina], o mensaje si no hay datos.
     """
     vs = get_vector_store()
 
@@ -73,13 +103,19 @@ def buscar_especificacion(especificacion: str, modelo: str) -> str:
 
 @tool
 def buscar_por_marca(marca: str) -> str:
-    """
-    Recupera información general de todos los modelos de una marca específica.
-    Usa esta tool cuando el usuario pregunte por una marca en general o quiera
-    comparar modelos de la misma marca.
+    """Recupera informacion general de todos los modelos de una marca especifica.
+
+    Realiza similarity search con filtro de metadata por marca (k=10).
+    Util para preguntas sobre el catalogo completo de una marca.
+
+    Usada cuando el usuario pregunta por una marca en general o quiere
+    explorar modelos de una misma marca.
 
     Args:
         marca: Nombre de la marca (ej: 'Toyota', 'Volkswagen', 'Mazda').
+
+    Returns:
+        Fragmentos de contexto con metadata [modelo, pagina], o mensaje si no hay datos.
     """
     vs = get_vector_store()
 
@@ -101,17 +137,27 @@ def buscar_por_marca(marca: str) -> str:
 
 @tool
 def comparar_modelos(modelo1: str, modelo2: str) -> str:
-    """
-    Extrae especificaciones de dos modelos y genera una tabla comparativa en markdown.
-    Usa esta tool cuando el usuario quiera comparar dos vehículos entre sí.
+    """Genera una tabla comparativa en markdown entre dos modelos.
+
+    Proceso:
+    1. Busca chunks de cada modelo por separado (k=8 cada uno)
+    2. Envia ambos contextos al LLM con instrucciones de formato
+    3. El LLM genera tabla markdown solo con datos reales disponibles
+    4. Si faltan demasiados datos, genera bullets explicativos en vez de tabla
+
+    Usada cuando el usuario quiere comparar dos vehiculos entre si.
 
     Args:
         modelo1: Nombre del primer modelo (ej: 'Hilux', 'Corolla Cross').
         modelo2: Nombre del segundo modelo (ej: 'Fortuner', 'Yaris Cross').
+
+    Returns:
+        Tabla comparativa markdown o explicacion de datos faltantes.
     """
     vs = get_vector_store()
 
     def _buscar(modelo: str):
+        """Busca chunks relevantes para un modelo especifico."""
         docs = vs.similarity_search(modelo, k=8)
         return "\n\n".join(d.page_content for d in docs)
 
@@ -145,12 +191,21 @@ Reglas de formato:
 
 @tool
 def resumir_ficha(modelo: str) -> str:
-    """
-    Genera un resumen estructurado en markdown de la ficha técnica de un modelo.
-    Usa esta tool cuando el usuario pida un resumen, overview o descripción general de un vehículo.
+    """Genera un resumen estructurado en markdown de la ficha tecnica de un modelo.
+
+    Proceso:
+    1. Busca chunks del modelo (k=10 para cobertura amplia)
+    2. Envia contexto al LLM con instrucciones de formato por secciones
+    3. El LLM organiza en: Motor, Rendimiento, Dimensiones, Equipamiento, Versiones
+    4. Si hay pocos datos, agrega seccion 'Datos faltantes' con bullets
+
+    Usada cuando el usuario pide un resumen, overview o descripcion general.
 
     Args:
         modelo: Nombre del modelo (ej: 'Prado', 'BZ4X', 'Mazda Cx 5 2026').
+
+    Returns:
+        Resumen estructurado en markdown o mensaje si no hay datos.
     """
     vs = get_vector_store()
 

@@ -1,230 +1,358 @@
-# RAG Application (LangChain + LangGraph + FastAPI + Streamlit)
+# RAG Ontologica — Sistema RAG para Fichas Tecnicas Vehiculares
 
-This project implements a Retrieval-Augmented Generation (RAG) system
-using:
+Sistema de Generacion Aumentada por Recuperacion (RAG) especializado en fichas tecnicas
+de vehiculos. Permite consultar, resumir y comparar especificaciones de multiples marcas
+y modelos usando lenguaje natural.
 
--   LangChain
--   LangGraph
--   FastAPI (backend)
--   Streamlit (frontend)
--   ChromaDB (vector database)
--   OpenAI (LLM + embeddings)
+## Stack Tecnologico
 
-------------------------------------------------------------------------
+| Componente | Tecnologia |
+|------------|-----------|
+| Backend API | FastAPI + Uvicorn |
+| Orquestacion | LangGraph (grafo de estados) |
+| LLM | OpenAI `gpt-5-nano` |
+| Embeddings | HuggingFace `all-MiniLM-L6-v2` |
+| Base vectorial | ChromaDB (persistencia local) |
+| Frontend | Streamlit |
+| OCR | EasyOCR (paginas escaneadas) |
+| Extraccion PDF | pdfplumber |
 
-## Project Structure
+---
 
-    rag-ing-ontologica/
-    │
-    ├── backend/
-    │   ├── app.py
-    │   ├── rag_graph.py
-    │   ├── rag_store.py
-    │   ├── data/              #PDFs here
-    │   └── .env              
-    │
-    ├── frontend/
-    │   ├── streamlit_app.py
-    │   └── .streamlit/
-    │
-    ├── requeriments.txt
-    └── README.md
+## Estructura del Proyecto
 
-------------------------------------------------------------------------
+```
+rag-ing-ontologica/
+│
+├── backend/
+│   ├── app.py              # API FastAPI: endpoints /ingest y /chat/stream
+│   ├── rag_graph.py         # Grafo LangGraph: flujo completo del RAG
+│   ├── rag_store.py         # ChromaDB: ingestion, embeddings, vector store
+│   ├── tools.py             # Tools de LangGraph (listar, buscar, comparar, resumir)
+│   ├── schemas.py           # Modelos Pydantic (IntentClassification, GroundingEvaluation)
+│   ├── prompts.py           # System prompts (clasificador, generador, critico)
+│   ├── data/                # PDFs organizados por marca (Toyota/, Mazda/, etc.)
+│   │   ├── Toyota/
+│   │   ├── Mazda/
+│   │   ├── Volkswagen/
+│   │   ├── Peugeot/
+│   │   ├── Opel/
+│   │   ├── MG Emotor/
+│   │   └── Seat/
+│   └── chroma_db/           # Base vectorial persistida (SQLite + HNSW)
+│
+├── frontend/
+│   └── streamlit_app.py     # Interfaz de chat Streamlit
+│
+├── .env                     # Variables de entorno (OPENAI_API_KEY, HF_TOKEN)
+├── requeriments.txt         # Dependencias Python
+└── README.md
+```
 
-## Requirements
+---
 
--   Python 3.12
+## Datos Disponibles
 
-------------------------------------------------------------------------
+- **6 marcas**: Toyota, Mazda, Volkswagen, Peugeot, Opel, MG Emotor, Seat
+- **50 modelos** indexados
+- **584 chunks** en ChromaDB
+- Metadata por chunk: `source`, `page`, `marca`, `modelo`, `doc_id`, `chunk_id`, `ocr`
 
-## Initial Setup (Run Once)
+---
 
-### Install Python 3.12
+## Flujo General del Grafo RAG
 
-    download from 
+El sistema usa un grafo de estados LangGraph con 8 nodos y 4 rutas posibles:
 
-### Create Virtual Environment
+```
+START
+  │
+  ▼
+┌─────────────────────┐
+│  1. classify_intent  │  LLM clasifica la pregunta en 4 intents
+└──────────┬──────────┘
+           │
+    ┌──────┴──────────────────────┐
+    │                             │
+ GENERAL                    needs_retrieval
+    │                             │
+    ▼                             ▼
+┌──────────────┐       ┌──────────────────┐
+│ answer_general│       │   2. retrieve     │  Busqueda semantica en ChromaDB
+└──────┬───────┘       └────────┬─────────┘
+       │                        │
+       ▼                        ▼
+      END              ┌──────────────────┐
+                       │  3. decide_tools  │  ¿Comparacion o Resumen?
+                       └────────┬─────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+              usar_tools=true         usar_tools=false
+                    │                       │
+                    ▼                       │
+           ┌───────────────┐                │
+           │  4. call_tools │  LLM genera   │
+           └───────┬───────┘  tool_calls    │
+                   │                        │
+                   ▼                        │
+           ┌───────────────┐                │
+           │   5. tools     │  Ejecuta      │
+           └───────┬───────┘  las tools     │
+                   │                        │
+                   ▼                        │
+           ┌───────────────────────┐◄───────┘
+           │ 6. generate_grounded  │  Genera respuesta con citas
+           └───────────┬───────────┘
+                       │        ▲
+                       ▼        │ retry (score < 0.5 y retry < 1)
+           ┌───────────────────────┐
+           │ 7. evaluate_grounding │  Critico evalua calidad
+           └───────┬───────┬───────┘
+                   │       │
+              aprobado   rechazado + max retries
+                   │       │
+                   ▼       ▼
+                  END   fallback seguro → END
+```
 
-    cd path-to-rag/rag-ing-ontologica
-    py -3.12 -m venv .venv  
-    .\.venv\Scripts\Activate
+### Rutas del grafo
 
+| Ruta | Intent | Nodos | Descripcion |
+|------|--------|-------|-------------|
+| **A** | GENERAL | classify → answer_general → END | Conocimiento general sin retrieval |
+| **B** | Busqueda | classify → retrieve → decide_tools → generate → evaluate → END | Dato tecnico puntual |
+| **C** | Resumen | classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END | Ficha completa con tool `resumir_ficha` |
+| **D** | Comparacion | classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END | Tabla comparativa con tool `comparar_modelos` |
 
-### Install Dependencies
+### Detalle de cada nodo
 
-    pip install -r requeriments.txt
+#### 1. `classify_intent` — Clasificador de intencion
+- **LLM**: gpt-5-nano (temperature=0)
+- Clasifica en: Busqueda, Resumen, Comparacion, GENERAL
+- Extrae entidades: marca, modelo, ano, version
+- Sugiere `suggested_k` (cuantos chunks recuperar)
+- Memory: si no hay modelo en la pregunta, usa `last_model`/`last_make` del turno anterior
+- Keyword fallback: regex corrige clasificaciones erroneas
 
-------------------------------------------------------------------------
+#### 2. `retrieve` — Recuperacion semantica
+- Busca en ChromaDB usando `similarity_search`
+- **Dynamic k**: usa `suggested_k` del clasificador o mapa fijo
+- Reescribe la query para resolver referencias ("ese modelo" → nombre real)
+- Filtros de metadata por marca/modelo con variantes normalizadas
+- Comparaciones: retrieval balanceado (k/2 por cada modelo)
 
-## Add Documents for RAG
+#### 3. `decide_tools` — Decision determinista
+- Comparacion y Resumen siempre activan tools
+- Busqueda no usa tools (genera directo desde contexto)
+- Keyword fallback como segunda red de seguridad
 
-Place your PDFs inside:
+#### 4. `call_tools` + `tools` — Ejecucion de herramientas
+- **Tools disponibles**:
+  - `listar_modelos_disponibles` — catalogo de modelos indexados
+  - `buscar_especificacion` — dato tecnico puntual
+  - `buscar_por_marca` — todos los modelos de una marca
+  - `comparar_modelos` — tabla comparativa markdown
+  - `resumir_ficha` — resumen estructurado markdown
 
+#### 5. `generate_grounded` — Generacion con grounding
+- Combina contexto de retrieval + output de tools
+- Citas obligatorias: `[doc_id=<archivo>; pagina=<N>]`
+- Si es reintento, incluye feedback del critico como correccion
+- Guarda trazabilidad: prompt completo, snippets de chunks
+
+#### 6. `evaluate_grounding` — Critico de calidad
+- Evalua: soportada por contexto, tiene citas, es completa
+- Score 0.0 - 1.0
+- Si rechazada (score < 0.5) y hay reintentos disponibles → vuelve a generar
+- Si rechazada sin reintentos → respuesta fallback segura
+- Maximo 1 reintento (configurable con `MAX_RETRIES`)
+
+### Features adicionales
+
+- **Regeneration loop**: el critico puede rechazar y forzar un reintento con feedback correctivo
+- **Memory conversacional**: `last_model`/`last_make` persisten entre turnos con reducer `_keep_latest`
+- **Trazabilidad completa**: cada nodo registra su paso, decisiones, chunks, prompt enviado
+- **Anti-hallucination**: keyword override, grounding estricto, fallback seguro
+
+---
+
+## Configuracion en Windows
+
+### Requisitos previos
+
+- **Python 3.12** — descargar de https://www.python.org/downloads/
+- **Git** — descargar de https://git-scm.com/
+- Cuenta de OpenAI con API key activa (para gpt-5-nano)
+
+### 1. Clonar el repositorio
+
+```powershell
+git clone https://github.com/lmcastanoh/rag-ing-ontologica.git
+cd rag-ing-ontologica
+```
+
+### 2. Crear entorno virtual
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate
+```
+
+### 3. Instalar dependencias
+
+```powershell
+pip install -r requeriments.txt
+```
+
+### 4. Configurar variables de entorno
+
+Crear archivo `.env` en la raiz del proyecto:
+
+```env
+OPENAI_API_KEY=sk-tu-clave-aqui
+HF_TOKEN=hf-tu-token-aqui
+```
+
+### 5. Agregar documentos PDF
+
+Colocar los PDFs dentro de `backend/data/` organizados por marca:
+
+```
 backend/data/
+├── Toyota/
+│   ├── ficha-tecnica-hilux.pdf
+│   └── ficha-tecnica-fortuner.pdf
+├── Mazda/
+│   └── ficha-tecnica-mazda-cx-5-2026.pdf
+└── ...
+```
 
-Example:
+### 6. Ejecutar el backend (Terminal 1)
 
-    backend/data/
-      file1.pdf
-      file2.pdf
+```powershell
+cd rag-ing-ontologica
+.\.venv\Scripts\Activate
+cd backend
+uvicorn app:app --reload --port 8001
+```
 
-------------------------------------------------------------------------
+Verificar en: http://localhost:8001/docs
 
-## Run Backend (FastAPI)
+### 7. Ingestar documentos
 
-Terminal 1:
+Desde Swagger UI (http://localhost:8001/docs) o con curl:
 
-    cd path-to/rag-ing-ontologica
-    .\.venv\Scripts\Activate
-    cd backend
-    uvicorn app:app --reload --port 8001
+```powershell
+curl -X POST http://localhost:8001/ingest -H "Content-Type: application/json" -d "{\"data_dir\": \"./data\"}"
+```
 
-Optional debug:
+Respuesta esperada:
 
-    uvicorn app:app --reload --port 8001 --log-level debug
+```json
+{
+  "files_dir": "./data",
+  "raw_docs": 50,
+  "chunks": 584,
+  "ids_added": 584
+}
+```
 
-Verify:
+### 8. Ejecutar el frontend (Terminal 2)
 
-http://localhost:8001/docs
+```powershell
+cd rag-ing-ontologica
+.\.venv\Scripts\Activate
+cd frontend
+streamlit run streamlit_app.py
+```
 
-------------------------------------------------------------------------
+Acceder en: http://localhost:8501
 
-## Run Frontend (Streamlit)
+---
 
-Terminal 2:
+## Endpoints de la API
 
-    cd path-to/rag-ing-ontologica
-    .\.venv\Scripts\Activate
-    cd frontend
-    streamlit run streamlit_app.py
+### `POST /ingest`
 
-Streamlit runs at:
+Ingesta documentos PDF desde un directorio.
 
-http://localhost:8501
+```json
+// Request
+{"data_dir": "./data"}
 
-------------------------------------------------------------------------
+// Response
+{"files_dir": "./data", "raw_docs": 50, "chunks": 584, "ids_added": 584}
+```
 
+### `POST /chat/stream`
 
-## Ingest Documents
+Chat con streaming via Server-Sent Events (SSE).
 
-Go to:
+```json
+// Request
+{"question": "¿Cual es la potencia del Toyota Hilux?", "session_id": "sesion-1"}
+```
 
-http://localhost:8001/docs
+Eventos SSE:
+- `token` — respuesta final del RAG
+- `trazabilidad` — JSON con la ruta completa, decisiones, chunks, evaluacion
+- `done` — fin del stream
 
-POST /ingest
+---
 
-Body:
+## Solucion de problemas
 
-    {
-      "data_dir": "./data"
-    }
+### Puerto en uso
 
-Expected response:
+```powershell
+# Encontrar proceso usando el puerto
+netstat -ano | findstr :8001
+# Terminar proceso (reemplazar PID)
+taskkill /PID <PID> /F
+# O usar otro puerto
+uvicorn app:app --reload --port 8002
+```
 
-    {
-      "files_dir": "./data",
-      "raw_docs": 5,
-      "chunks": 42,
-      "ids_added": 42
-    }
+### Error de OpenAI 401
 
-------------------------------------------------------------------------
+Verificar que `OPENAI_API_KEY` esta configurada en `.env`.
 
-## Test Chat
+### Error de OpenAI 429 (cuota excedida)
 
-POST /chat or /chat/stream
+Verificar creditos en: https://platform.openai.com/account/billing
 
-Example:
+### Streamlit no encontrado
 
-    {
-      "question": "What is the main topic of the documents?"
-    }
+```powershell
+pip install streamlit
+```
 
-------------------------------------------------------------------------
+### EasyOCR lento en primera ejecucion
 
-## View LangGraph Structure
+Es normal: descarga modelos de ~100 MB la primera vez. Las ejecuciones siguientes usan cache.
 
-In rag_graph.py add:
+---
 
-    print(graph.get_graph().draw_ascii())
+## Visualizar estructura del grafo
 
-Restart backend to see:
+El grafo se imprime en ASCII al iniciar el backend. Para generar diagrama Mermaid:
 
-START → retrieve → generate → END
+```python
+# En rag_graph.py
+print(graph.get_graph().draw_mermaid())
+```
 
-For Mermaid:
+Pegar el resultado en: https://mermaid.live
 
-    print(graph.get_graph().draw_mermaid())
+---
 
-Paste into:
+## Comandos rapidos (Windows PowerShell)
 
-https://mermaid.live
+```powershell
+# Backend
+cd rag-ing-ontologica && .\.venv\Scripts\Activate && cd backend && uvicorn app:app --reload --port 8001
 
-------------------------------------------------------------------------
-
-## Troubleshooting
-
-Port already in use:
-
-    pkill -f uvicorn
-
-Or change port:
-
-    uvicorn app:app --reload --port 8002
-
-Then update API_BASE accordingly.
-
-Streamlit not found:
-
-    pip install streamlit
-
-OpenAI 401 error:
-
-    echo $OPENAI_API_KEY
-
-OpenAI 429 error (Quota exceeded):
-
-Check billing: https://platform.openai.com/account/billing
-
-Or switch embedding model:
-
-    OpenAIEmbeddings(model="text-embedding-3-small")
-
-------------------------------------------------------------------------
-
-## Quick Start Commands
-
-Backend:
-
-    cd rag-ing-ontologica
-    source .venv/bin/activate
-    cd backend
-    uvicorn app:app --reload --port 8001
-
-Frontend:
-
-    cd rag-ing-ontologica
-    source .venv/bin/activate
-    cd frontend
-    streamlit run streamlit_app.py
-
-------------------------------------------------------------------------
-
-## Architecture Overview
-
-User (Streamlit)\
-↓\
-FastAPI Backend\
-↓\
-LangGraph\
-↓\
-Retriever (Chroma)\
-↓\
-OpenAI Embeddings\
-↓\
-OpenAI Chat Model
-
-------------------------------------------------------------------------
-
-Your RAG system is now fully operational.
+# Frontend (otra terminal)
+cd rag-ing-ontologica && .\.venv\Scripts\Activate && cd frontend && streamlit run streamlit_app.py
+```
