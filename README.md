@@ -1,4 +1,4 @@
-# RAG Ontologica — Sistema RAG para Fichas Tecnicas Vehiculares
+# Sistema RAG para Fichas Tecnicas Vehiculares
 
 Sistema de Generacion Aumentada por Recuperacion (RAG) especializado en fichas tecnicas
 de vehiculos. Permite consultar, resumir y comparar especificaciones de multiples marcas
