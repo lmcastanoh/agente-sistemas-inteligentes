@@ -95,7 +95,8 @@ async def chat_stream(req: ChatRequest):
             "docs": [],
             "answer": "",
             "messages": [HumanMessage(content=req.question)],
-            "usar_tools": False,
+            "agent_steps": [],
+            "agent_context": "",
         }
         # thread_id vincula esta invocacion a una sesion persistente (MemorySaver)
         config = {"configurable": {"thread_id": req.session_id}}

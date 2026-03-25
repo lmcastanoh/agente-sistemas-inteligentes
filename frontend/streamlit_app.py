@@ -164,6 +164,18 @@ if prompt:
                     ]
                     st.markdown("\n".join(rows))
 
+                agent_steps = trazabilidad_data.get("agent_steps", [])
+                if agent_steps:
+                    st.markdown(f"**Pasos del agente ReAct:** {len(agent_steps)}")
+                    tools_used = trazabilidad_data.get("tools_used", [])
+                    if tools_used:
+                        st.markdown(f"**Herramientas usadas:** {', '.join(tools_used)}")
+                    for step in agent_steps:
+                        if step.get("type") == "tool_call":
+                            st.markdown(f"  - Paso {step['step']}: `{step['tool']}`({step.get('args', {})})")
+                        elif step.get("type") == "final_reasoning":
+                            st.markdown(f"  - Paso {step['step']}: Razonamiento final")
+
                 ver = trazabilidad_data.get("verificacion") or trazabilidad_data.get("evaluation_result") or {}
                 if ver:
                     aprobada = ver.get("aprobada", ver.get("approved"))

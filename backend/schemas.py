@@ -6,9 +6,30 @@
 # ==============================================================================
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+# ── Mapa de secuencias corruptas comunes a sus caracteres correctos ──────────
+# Patron: caracter de reemplazo Unicode (U+FFFD) seguido de un codigo hex
+# Ejemplo: \ufffd f3 → ó, \ufffd e1 → á, \ufffd ed → í
+_MOJIBAKE_MAP = {
+    "\ufffde1": "á", "\ufffde9": "é", "\ufffded": "í",
+    "\ufffdf3": "ó", "\ufffdfa": "ú", "\ufffdf1": "ñ",
+    "\ufffdc1": "Á", "\ufffdc9": "É", "\ufffdcd": "Í",
+    "\ufffdd3": "Ó", "\ufffdda": "Ú", "\ufffdd1": "Ñ",
+    "\ufffdfc": "ü", "\ufffddc": "Ü",
+}
+_MOJIBAKE_RE = re.compile("|".join(re.escape(k) for k in _MOJIBAKE_MAP))
+
+
+def _fix_encoding(text: str) -> str:
+    """Corrige caracteres corruptos (mojibake) en texto generado por LLMs."""
+    if not text or "\ufffd" not in text:
+        return text
+    return _MOJIBAKE_RE.sub(lambda m: _MOJIBAKE_MAP[m.group()], text)
 
 
 class IntentEntities(BaseModel):
@@ -76,10 +97,26 @@ class GroundingEvaluation(BaseModel):
 
 
 def intent_to_dict(intent: IntentClassification) -> dict[str, Any]:
-    """Convierte IntentClassification a dict para almacenar en RAGState."""
-    return intent.model_dump()
+    """Convierte IntentClassification a dict para almacenar en RAGState.
+
+    Aplica _fix_encoding a campos de texto para corregir mojibake.
+    """
+    data = intent.model_dump()
+    if data.get("reason"):
+        data["reason"] = _fix_encoding(data["reason"])
+    if data.get("clarification_question"):
+        data["clarification_question"] = _fix_encoding(data["clarification_question"])
+    return data
 
 
 def eval_to_dict(result: GroundingEvaluation) -> dict[str, Any]:
-    """Convierte GroundingEvaluation a dict para almacenar en RAGState."""
-    return result.model_dump()
+    """Convierte GroundingEvaluation a dict para almacenar en RAGState.
+
+    Aplica _fix_encoding a los campos de texto para corregir caracteres
+    corruptos (mojibake) que el LLM puede generar con acentos españoles.
+    """
+    data = result.model_dump()
+    data["issues"] = [_fix_encoding(s) for s in data.get("issues", [])]
+    if data.get("clarification_question"):
+        data["clarification_question"] = _fix_encoding(data["clarification_question"])
+    return data

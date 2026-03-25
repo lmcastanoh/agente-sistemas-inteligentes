@@ -1,17 +1,18 @@
 # backend/tools.py
 # ==============================================================================
-# Tools de LangGraph para el sistema RAG de fichas tecnicas vehiculares.
+# Tools de LangGraph para el sistema RAG agéntico de fichas técnicas vehiculares.
 #
-# Estas tools son invocadas por el LLM en el nodo call_tools cuando el flujo
-# pasa por Comparacion o Resumen. El ToolNode de LangGraph las ejecuta
-# automaticamente a partir de los tool_calls generados por el LLM.
+# Estas tools son invocadas por el agente ReAct (nodo agent_reason) de forma
+# autónoma. El agente decide cuándo y qué herramientas usar en su ciclo de
+# razonamiento.
 #
 # Tools disponibles:
-#   - listar_modelos_disponibles: catalogo de modelos indexados
-#   - buscar_especificacion:      dato tecnico puntual de un modelo
+#   - listar_modelos_disponibles: catálogo de modelos indexados
+#   - buscar_especificacion:      dato técnico puntual de un modelo
 #   - buscar_por_marca:           todos los modelos de una marca
 #   - comparar_modelos:           tabla comparativa entre 2 modelos
 #   - resumir_ficha:              resumen estructurado de un modelo
+#   - refinar_busqueda:           búsqueda adicional con query/filtros diferentes
 # ==============================================================================
 from __future__ import annotations
 
@@ -237,3 +238,53 @@ Reglas de formato:
 
     response = _get_llm().invoke(prompt)
     return str(response.content)
+
+
+@tool
+def refinar_busqueda(query: str, k: int = 6, marca: str = "", modelo: str = "") -> str:
+    """Realiza una búsqueda adicional en la base de conocimiento con query y filtros diferentes.
+
+    Útil cuando el contexto inicial no responde la pregunta o falta información.
+    Permite reformular la consulta o aplicar filtros distintos para obtener
+    chunks más relevantes.
+
+    Args:
+        query:  Nueva consulta reformulada para búsqueda semántica.
+        k:      Número de chunks a recuperar (default 6, max 15).
+        marca:  Filtro opcional por marca (ej: 'Toyota', 'Mazda').
+        modelo: Filtro opcional por modelo (ej: 'Hilux', 'CX-5').
+
+    Returns:
+        Fragmentos de contexto con metadata [doc_id, página], o mensaje si no hay resultados.
+    """
+    vs = get_vector_store()
+    k = min(max(k, 1), 15)
+
+    where_filter = None
+    if modelo:
+        no_hyphen = modelo.replace("-", " ")
+        bases = {modelo, modelo.title(), no_hyphen, no_hyphen.title()}
+        variants = list(bases)
+        if marca:
+            for b in list(bases):
+                variants.append(f"{marca} {b}")
+        where_filter = {"modelo": {"$in": variants}}
+    elif marca:
+        where_filter = {"marca": marca}
+
+    if where_filter:
+        results = vs.similarity_search(query, k=k, filter=where_filter)
+        if not results:
+            results = vs.similarity_search(query, k=k)
+    else:
+        results = vs.similarity_search(query, k=k)
+
+    if not results:
+        return f"No se encontraron resultados para: '{query}'."
+
+    fragmentos = "\n---\n".join(
+        f"[doc_id={d.metadata.get('doc_id', d.metadata.get('source', ''))}; "
+        f"página={d.metadata.get('page', '')}]\n{d.page_content}"
+        for d in results
+    )
+    return f"Resultados ({len(results)} chunks):\n\n{fragmentos}"

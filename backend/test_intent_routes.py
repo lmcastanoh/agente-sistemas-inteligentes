@@ -7,7 +7,7 @@ from schemas import IntentClassification
 
 
 def route_from_intent(intent: IntentClassification) -> str:
-    return "RAG(retrieve->generate_grounded->evaluate_grounding)" if intent.needs_retrieval else "GENERAL(answer_general)"
+    return "RAG(retrieve→agent_reason→generate→evaluate)" if intent.needs_retrieval else "GENERAL(answer_general)"
 
 
 def main():

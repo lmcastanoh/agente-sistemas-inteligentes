@@ -1,17 +1,19 @@
 # backend/rag_graph.py
 # ==============================================================================
-# Grafo LangGraph principal del sistema RAG para fichas tecnicas vehiculares.
+# Grafo LangGraph agéntico del sistema RAG para fichas técnicas vehiculares.
 #
-# Flujo: classify_intent → retrieve → decide_tools → [call_tools → tools] →
-#        generate_grounded → evaluate_grounding → [retry | END]
+# Flujo: classify_intent → retrieve → agent_reason → generate_grounded →
+#        evaluate_grounding → [retry | END]
 #
-# 4 rutas posibles:
-#   A) GENERAL:     classify → answer_general → END (sin retrieval)
-#   B) Busqueda:    classify → retrieve → decide_tools → generate → evaluate → END
-#   C) Resumen:     classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END
-#   D) Comparacion: classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END
+# 3 rutas posibles:
+#   A) GENERAL:  classify → answer_general → END (sin retrieval)
+#   B) RAG:      classify → retrieve → agent_reason → generate → evaluate → END
+#                (el agente ReAct decide autónomamente qué tools usar en loop)
 #
 # Features:
+#   - ReAct Agent: ciclo autónomo reason → act → observe en agent_reason
+#   - Retrieval autónomo: tool refinar_busqueda permite re-buscar con query diferente
+#   - Auto-reflexión: integrada en el prompt del agente ReAct
 #   - Dynamic k: el clasificador sugiere cuantos chunks recuperar
 #   - Regeneration loop: el critico puede rechazar y forzar un reintento (max 1)
 #   - Memory: last_model/last_make persisten entre turnos con reducer _keep_latest
@@ -39,6 +41,7 @@ from prompts import (
     GROUNDED_GENERATION_USER_TEMPLATE,
     GROUNDING_CRITIC_SYSTEM_PROMPT,
     GROUNDING_CRITIC_USER_TEMPLATE,
+    REACT_AGENT_SYSTEM_PROMPT,
 )
 from rag_store import get_vector_store
 from schemas import GroundingEvaluation, IntentClassification, eval_to_dict, intent_to_dict
@@ -47,6 +50,7 @@ from tools import (
     buscar_por_marca,
     comparar_modelos,
     listar_modelos_disponibles,
+    refinar_busqueda,
     resumir_ficha,
 )
 
@@ -187,28 +191,6 @@ def _extract_comparison_models(question: str) -> list[str] | None:
     return [m.group(1).strip(), m.group(2).strip()]
 
 
-def _extract_tool_results(messages: List[BaseMessage]) -> str:
-    """Extrae contenido de ToolMessages del historial de mensajes.
-
-    Despues de que ToolNode ejecuta las tools, los resultados quedan como
-    ToolMessage en el estado. Esta funcion los concatena para pasarlos
-    como contexto adicional a generate_grounded.
-
-    Args:
-        messages: Lista de mensajes del estado del grafo.
-
-    Returns:
-        Texto concatenado de todos los ToolMessages, separados por '---'.
-    """
-    parts: list[str] = []
-    for m in messages:
-        if isinstance(m, ToolMessage) and m.content:
-            content = m.content if isinstance(m.content, str) else str(m.content)
-            if content.strip():
-                parts.append(content.strip())
-    return "\n\n---\n\n".join(parts)
-
-
 # ── Configuracion del regeneration loop ──────────────────────────────────────
 # Numero maximo de reintentos cuando el critico rechaza la respuesta (score < 0.5).
 # En cada reintento, el feedback del critico se inyecta como instruccion de correccion.
@@ -234,7 +216,7 @@ def _keep_latest(existing: Optional[str], new: Optional[str]) -> Optional[str]:
 
 # ── Estado del grafo ─────────────────────────────────────────────────────────
 class RAGState(TypedDict):
-    """Estado compartido entre todos los nodos del grafo LangGraph.
+    """Estado compartido entre todos los nodos del grafo LangGraph agéntico.
 
     Campos:
         question:        Pregunta actual del usuario.
@@ -243,7 +225,8 @@ class RAGState(TypedDict):
         messages:        Historial de mensajes (con reducer add_messages de LangGraph).
         intent:          Resultado del clasificador (dict de IntentClassification).
         eval_result:     Resultado del critico (dict de GroundingEvaluation).
-        usar_tools:      Flag: True si el flujo pasa por call_tools/tools.
+        agent_steps:     Log de pasos del agente ReAct (reason/tool_call/final).
+        agent_context:   Output acumulado de las tools ejecutadas por el agente.
         trazabilidad:    Dict acumulativo con ruta, decisiones, chunks, prompts.
         last_model:      Ultimo modelo mencionado (persiste entre turnos con _keep_latest).
         last_make:       Ultima marca mencionada (persiste entre turnos con _keep_latest).
@@ -257,7 +240,8 @@ class RAGState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     intent: Optional[dict[str, Any]]
     eval_result: Optional[dict[str, Any]]
-    usar_tools: bool
+    agent_steps: list[dict[str, Any]]
+    agent_context: str
     trazabilidad: dict[str, Any]
     last_model: Annotated[Optional[str], _keep_latest]
     last_make: Annotated[Optional[str], _keep_latest]
@@ -404,6 +388,7 @@ def build_rag_graph():
         buscar_por_marca,
         comparar_modelos,
         resumir_ficha,
+        refinar_busqueda,
     ]
     tool_node = ToolNode(tools)
 
@@ -490,43 +475,6 @@ def build_rag_graph():
             }
         updates["trazabilidad"] = traza
         return updates
-
-    # Intents que siempre disparan tools (decision determinista en decide_tools)
-    _TOOL_INTENTS = {"Comparación", "Resumen"}
-
-    # ── Nodo 3: decide_tools ─────────────────────────────────────────────
-    def decide_tools(state: RAGState) -> dict[str, Any]:
-        """Decide si el flujo debe pasar por call_tools/tools o ir directo a generate.
-
-        Decision determinista (no usa LLM):
-        - Comparacion y Resumen SIEMPRE activan tools
-        - Busqueda NO usa tools (genera directo desde contexto)
-        - Keyword fallback como segunda red de seguridad
-
-        Retorna: usar_tools (bool), trazabilidad actualizada
-        """
-        intent = state.get("intent") or {}
-        intent_name = intent.get("intent", "")
-        question = state.get("question", "")
-
-        usar_tools = intent_name in _TOOL_INTENTS
-
-        # Keyword fallback: si el clasificador erro, detectar por palabras clave
-        kw_override = _keyword_intent_override(question)
-        if not usar_tools and kw_override:
-            usar_tools = True
-
-        motivo = f"intent={intent_name}, en _TOOL_INTENTS={intent_name in _TOOL_INTENTS}"
-        if kw_override and intent_name not in _TOOL_INTENTS:
-            motivo += f", keyword_override={kw_override} (query matched fallback regex)"
-
-        traza = dict(state.get("trazabilidad") or {})
-        traza["ruta"] = traza.get("ruta", []) + ["decide_tools"]
-        traza["tools_decision"] = {
-            "usar_tools": usar_tools,
-            "motivo": motivo,
-        }
-        return {"usar_tools": usar_tools, "trazabilidad": traza}
 
     # ── Nodo 2a: answer_general ──────────────────────────────────────────
     def answer_general(state: RAGState) -> dict[str, Any]:
@@ -677,44 +625,90 @@ def build_rag_graph():
             }
         return {"docs": docs, "trazabilidad": traza}
 
-    # ── Nodo 4: call_tools ───────────────────────────────────────────────
-    def call_tools(state: RAGState) -> dict[str, Any]:
-        """LLM genera tool_calls que luego ejecuta el ToolNode.
+    # ── Limite de iteraciones del agente ReAct ────────────────────────────
+    MAX_AGENT_ITERATIONS = 5
 
-        El LLM con tools bindeadas decide que herramientas invocar
-        (resumir_ficha, comparar_modelos, buscar_especificacion, etc.)
-        basado en la pregunta del usuario. No ejecuta las tools directamente;
-        genera AIMessage con tool_calls que el ToolNode procesa despues.
+    # ── Nodo 3: agent_reason (ReAct loop) ─────────────────────────────────
+    def agent_reason(state: RAGState) -> dict[str, Any]:
+        """Agente ReAct: razona, usa tools autónomamente, observa resultados, repite.
 
-        Retorna: messages (con AIMessage que contiene tool_calls), trazabilidad
+        Ciclo: reason → act (tool_call) → observe (tool result) → reason → ...
+        Termina cuando el LLM responde sin tool_calls (tiene suficiente info)
+        o se alcanza MAX_AGENT_ITERATIONS.
+
+        Incluye auto-reflexión en el prompt: si el contexto es insuficiente,
+        el agente usa refinar_busqueda antes de dar su respuesta final.
+
+        Retorna: agent_steps, agent_context, trazabilidad
         """
         question = state["question"]
         docs = state.get("docs", [])
+        intent = state.get("intent") or {}
         context = _retrieval_context(docs) if docs else ""
 
-        response = answer_llm_with_tools.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "Eres un asistente de fichas técnicas vehiculares con acceso a tools.\n"
-                        "Usa las tools disponibles para responder la consulta.\n"
-                        "DEBES invocar al menos una tool."
-                    )
-                ),
-                HumanMessage(content=question),
-            ]
+        system_prompt = REACT_AGENT_SYSTEM_PROMPT.format(
+            context=context,
+            intent=intent.get("intent", "Búsqueda"),
         )
-        traza = dict(state.get("trazabilidad") or {})
-        traza["ruta"] = traza.get("ruta", []) + ["call_tools"]
-        return {"messages": [response], "trazabilidad": traza}
 
-    # ── Nodo 6: generate_grounded ────────────────────────────────────────
+        agent_messages: list[BaseMessage] = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=question),
+        ]
+
+        steps: list[dict[str, Any]] = []
+        accumulated_tool_output: list[str] = []
+
+        for i in range(MAX_AGENT_ITERATIONS):
+            response = answer_llm_with_tools.invoke(agent_messages)
+            agent_messages.append(response)
+
+            if not response.tool_calls:
+                steps.append({
+                    "step": i + 1,
+                    "type": "final_reasoning",
+                    "content": (response.content or "")[:200],
+                })
+                break
+
+            # Ejecutar tools via ToolNode (invocación directa, no como nodo del grafo)
+            tool_result = tool_node.invoke({"messages": [response]})
+            tool_msgs = tool_result.get("messages", [])
+            for tm in tool_msgs:
+                agent_messages.append(tm)
+                if isinstance(tm, ToolMessage) and tm.content:
+                    content = tm.content if isinstance(tm.content, str) else str(tm.content)
+                    accumulated_tool_output.append(content)
+
+            for tc in response.tool_calls:
+                steps.append({
+                    "step": i + 1,
+                    "type": "tool_call",
+                    "tool": tc["name"],
+                    "args": tc["args"],
+                })
+
+        agent_context = "\n\n---\n\n".join(accumulated_tool_output)
+
+        traza = dict(state.get("trazabilidad") or {})
+        traza["ruta"] = traza.get("ruta", []) + ["agent_reason"]
+        traza["agent_steps"] = steps
+        traza["agent_iterations"] = len(steps)
+        traza["tools_used"] = list({s["tool"] for s in steps if s["type"] == "tool_call"})
+
+        return {
+            "agent_steps": steps,
+            "agent_context": agent_context,
+            "trazabilidad": traza,
+        }
+
+    # ── Nodo 4: generate_grounded ──────────────────────────────────────
     def generate_grounded(state: RAGState) -> dict[str, Any]:
         """Genera la respuesta final con grounding estricto.
 
-        Combina contexto de retrieval (chunks de ChromaDB) con output de tools
-        (si las hubo) y genera la respuesta usando el LLM con reglas estrictas
-        anti-hallucination.
+        Combina contexto de retrieval (chunks de ChromaDB) con output del agente
+        ReAct (si usó tools) y genera la respuesta usando el LLM con reglas
+        estrictas anti-hallucination.
 
         Si es un reintento (critic_feedback presente), adjunta las instrucciones
         de correccion del critico al prompt para que el LLM corrija los problemas.
@@ -727,21 +721,19 @@ def build_rag_graph():
         context = _retrieval_context(docs)
         question = state["question"]
 
-        # Extraer resultados de tools (ToolMessages) si existen
-        tool_output = ""
-        if state.get("usar_tools", False):
-            tool_output = _extract_tool_results(state.get("messages") or [])
+        # Obtener contexto acumulado del agente ReAct (output de tools ejecutadas)
+        agent_context = state.get("agent_context", "")
 
-        # Combinar contexto de retrieval con output de tools
+        # Combinar contexto de retrieval con output del agente
         combined_context = context
-        if tool_output:
+        if agent_context:
             if combined_context:
-                combined_context += "\n\n=== Resultado de tools ===\n\n" + tool_output
+                combined_context += "\n\n=== Resultado del agente ===\n\n" + agent_context
             else:
-                combined_context = tool_output
+                combined_context = agent_context
 
-        # Si no hay contexto ni tools, retornar mensaje de "no encontrado"
-        if not docs and not tool_output:
+        # Si no hay contexto ni output del agente, retornar mensaje de "no encontrado"
+        if not docs and not agent_context:
             answer = "No encontrado en el contexto recuperado."
             traza = dict(state.get("trazabilidad") or {})
             traza["ruta"] = traza.get("ruta", []) + ["generate_grounded"]
@@ -749,7 +741,7 @@ def build_rag_graph():
                 "modo": "grounded_rag",
                 "question": question,
                 "retrieved_count": 0,
-                "tool_output": bool(tool_output),
+                "agent_context_included": bool(agent_context),
             }
             return {
                 "answer": answer,
@@ -773,7 +765,7 @@ def build_rag_graph():
             "modo": "grounded_rag",
             "question": question,
             "retrieved_count": len(docs),
-            "tool_output_included": bool(tool_output),
+            "agent_context_included": bool(agent_context),
             "formato_cita": "[doc_id=...; página=...; chunk_id=...]",
             "retry_count": state.get("retry_count", 0),
             "has_critic_feedback": bool(critic_feedback),
@@ -918,7 +910,7 @@ def build_rag_graph():
         eval_data = state.get("eval_result") or {}
         retry_count = state.get("retry_count", 0)
         rejected = not eval_data.get("approved", True) and eval_data.get("score", 1.0) < 0.5
-        if rejected and retry_count <= MAX_RETRIES and state.get("critic_feedback"):
+        if rejected and retry_count < MAX_RETRIES and state.get("critic_feedback"):
             return "generate_grounded"
         return END
 
@@ -929,23 +921,15 @@ def build_rag_graph():
             return "retrieve"
         return "answer_general"
 
-    def route_after_decide_tools(state: RAGState) -> str:
-        """Decide si pasar por tools o ir directo a generacion grounded."""
-        if state.get("usar_tools", False):
-            return "call_tools"
-        return "generate_grounded"
-
     # ── Ensamblaje del grafo ─────────────────────────────────────────────
 
     graph = (
         StateGraph(RAGState)
-        # Nodos
+        # Nodos (6: classify, answer_general, retrieve, agent_reason, generate, evaluate)
         .add_node("classify_intent", classify_intent)
         .add_node("answer_general", answer_general)
         .add_node("retrieve", retrieve)
-        .add_node("decide_tools", decide_tools)
-        .add_node("call_tools", call_tools)
-        .add_node("tools", tool_node)
+        .add_node("agent_reason", agent_reason)
         .add_node("generate_grounded", generate_grounded)
         .add_node("evaluate_grounding", evaluate_grounding)
         # Edges
@@ -956,14 +940,8 @@ def build_rag_graph():
             {"retrieve": "retrieve", "answer_general": "answer_general"},
         )
         .add_edge("answer_general", END)
-        .add_edge("retrieve", "decide_tools")
-        .add_conditional_edges(
-            "decide_tools",
-            route_after_decide_tools,
-            {"call_tools": "call_tools", "generate_grounded": "generate_grounded"},
-        )
-        .add_edge("call_tools", "tools")
-        .add_edge("tools", "generate_grounded")
+        .add_edge("retrieve", "agent_reason")
+        .add_edge("agent_reason", "generate_grounded")
         .add_edge("generate_grounded", "evaluate_grounding")
         .add_conditional_edges(
             "evaluate_grounding",
