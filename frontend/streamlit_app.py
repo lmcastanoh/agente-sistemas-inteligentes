@@ -13,10 +13,6 @@ def _clean_markdown(text: str) -> str:
         return ""
 
     out = text.replace("\r\n", "\n").replace("\r", "\n")
-    out = re.sub(r"(?m)^\s*#{1,6}\s*(.+)$", r"\1", out)
-    out = re.sub(r"(?m)^(\S+?)##\s*", r"\1\n", out)
-    out = out.replace(".-", ".\n- ")
-    out = re.sub(r"(?<!\n)-\s+", "\n- ", out)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
 
@@ -92,8 +88,18 @@ if prompt:
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
+        status_placeholder = st.empty()
         raw = ""
         trazabilidad_data: dict | None = None
+
+        # Mapa de nombres de nodos a labels amigables para el usuario
+        _NODE_LABELS = {
+            "classify_intent": "Clasificando intención...",
+            "retrieve": "Buscando documentos...",
+            "agent_reason": "Razonando con herramientas...",
+            "generate_grounded": "Generando respuesta...",
+            "eval_agent": "Evaluando calidad...",
+        }
 
         try:
             with requests.post(
@@ -117,14 +123,20 @@ if prompt:
                         elif line.startswith("data: "):
                             data = line[len("data: ") :]
                             if current_event == "token":
-                                raw += data
+                                status_placeholder.empty()
+                                raw += data.replace("\\n", "\n")
                                 placeholder.markdown(_clean_markdown(raw))
+                            elif current_event == "progress":
+                                label = _NODE_LABELS.get(data, data)
+                                if not raw:
+                                    status_placeholder.markdown(f"⏳ *{label}*")
                             elif current_event == "trazabilidad":
                                 try:
                                     trazabilidad_data = json.loads(data)
                                 except Exception:
                                     pass
                             elif current_event == "done":
+                                status_placeholder.empty()
                                 break
 
                     final_text = _clean_markdown(raw) if raw.strip() else "No se generó respuesta."
@@ -145,15 +157,6 @@ if prompt:
                         f"**Intención:** `{cls.get('intent', cls.get('intencion'))}` "
                         f"&nbsp;|&nbsp; **Requiere RAG:** `{cls.get('needs_retrieval', cls.get('requiere_rag'))}`"
                     )
-                    entidades = cls.get("entities", {})
-                    if entidades:
-                        st.markdown(
-                            f"**Entidades:** Marca={entidades.get('make')} | Modelo={entidades.get('model')} | "
-                            f"Año={entidades.get('year')}"
-                        )
-                    if cls.get("clarification_question"):
-                        st.markdown(f"**Pregunta de aclaración:** {cls.get('clarification_question')}")
-
                 chunks = trazabilidad_data.get("chunks_recuperados") or trazabilidad_data.get("retrieved_chunks") or []
                 if chunks:
                     k = trazabilidad_data.get("k_utilizado", trazabilidad_data.get("retrieval_k", "-"))
@@ -176,19 +179,15 @@ if prompt:
                         elif step.get("type") == "final_reasoning":
                             st.markdown(f"  - Paso {step['step']}: Razonamiento final")
 
-                ver = trazabilidad_data.get("verificacion") or trazabilidad_data.get("evaluation_result") or {}
-                if ver:
-                    aprobada = ver.get("aprobada", ver.get("approved"))
-                    puntuacion = ver.get("puntuacion", ver.get("score", 0))
-                    icono = "✅" if aprobada else "❌"
-                    st.markdown(
-                        f"**Verificación:** {icono} {'Aprobada' if aprobada else 'Rechazada'} "
-                        f"&nbsp;|&nbsp; Puntuación: `{puntuacion:.2f}` "
-                        f"&nbsp;|&nbsp; Reintentos: `{ver.get('reintentos', 0)}`"
-                    )
-                    issues = ver.get("issues", [])
-                    if issues:
-                        st.markdown("**Issues:**")
-                        st.markdown("\n".join([f"- {x}" for x in issues]))
+                eval_steps = trazabilidad_data.get("eval_steps", [])
+                if eval_steps:
+                    modified = trazabilidad_data.get("eval_modified", False)
+                    st.markdown(f"**Evaluación:** {'Corregida' if modified else 'Aprobada sin cambios'}")
+                    for step in eval_steps:
+                        if step.get("type") == "correction":
+                            st.markdown(f"  - Paso {step['step']}: `{step['tool']}`")
+                        elif step.get("type") == "approved":
+                            st.markdown(f"  - Paso {step['step']}: Aprobada")
+
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})

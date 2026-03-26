@@ -288,3 +288,56 @@ def refinar_busqueda(query: str, k: int = 6, marca: str = "", modelo: str = "") 
         for d in results
     )
     return f"Resultados ({len(results)} chunks):\n\n{fragmentos}"
+
+
+@tool
+def corregir_respuesta(respuesta: str, instrucciones: str) -> str:
+    """Corrige una respuesta aplicando instrucciones específicas.
+
+    Útil para fixes menores: reformatear citas, quitar datos no respaldados,
+    mejorar estructura markdown.
+
+    Args:
+        respuesta:     La respuesta original a corregir.
+        instrucciones: Qué corregir (ej: 'mover citas al final como fuentes').
+
+    Returns:
+        La respuesta corregida.
+    """
+    llm = _get_llm()
+    prompt = (
+        "Corrige esta respuesta siguiendo las instrucciones.\n"
+        "Devuelve SOLO la respuesta corregida, sin explicaciones.\n\n"
+        f"Instrucciones: {instrucciones}\n\n"
+        f"Respuesta original:\n{respuesta}"
+    )
+    result = llm.invoke(prompt)
+    return str(result.content)
+
+
+@tool
+def regenerar_respuesta(pregunta: str, contexto: str) -> str:
+    """Regenera una respuesta completa a partir de contexto nuevo o mejorado.
+
+    Útil cuando la respuesta original tenía problemas graves (modelo equivocado,
+    datos inventados) y se obtuvo mejor contexto con refinar_busqueda.
+
+    Args:
+        pregunta: La pregunta original del usuario.
+        contexto: El contexto actualizado/mejorado para generar la respuesta.
+
+    Returns:
+        Nueva respuesta generada desde el contexto proporcionado.
+    """
+    llm = _get_llm()
+    prompt = (
+        "Genera una respuesta clara y estructurada en markdown basada\n"
+        "ÚNICAMENTE en el contexto proporcionado. Incluye referencias numeradas [1], [2]\n"
+        "y una sección **Fuentes:** al final con viñetas.\n\n"
+        "Si el contexto no contiene información del modelo pedido, di explícitamente\n"
+        "que no se encontró información.\n\n"
+        f"Pregunta: {pregunta}\n\n"
+        f"Contexto:\n{contexto}"
+    )
+    result = llm.invoke(prompt)
+    return str(result.content)

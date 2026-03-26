@@ -18,7 +18,5 @@ pdfplumber
 easyocr
 Pillow
 numpy
-python-dotenv==1.2.1
 sentence-transformers
 langchain-huggingface
-grandalf

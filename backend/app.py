@@ -17,7 +17,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -89,7 +89,7 @@ async def chat_stream(req: ChatRequest):
     """
 
     async def event_gen():
-        # Estado inicial del grafo: pregunta, listas vacias, flags en false
+        # Estado inicial del grafo: pregunta, listas vacias
         inputs = {
             "question": req.question,
             "docs": [],
@@ -97,18 +97,52 @@ async def chat_stream(req: ChatRequest):
             "messages": [HumanMessage(content=req.question)],
             "agent_steps": [],
             "agent_context": "",
+            "eval_steps": [],
         }
         # thread_id vincula esta invocacion a una sesion persistente (MemorySaver)
         config = {"configurable": {"thread_id": req.session_id}}
 
-        # Ejecutar el grafo completo y emitir solo la respuesta final
+        # Streaming real: emitir tokens de generate_grounded en tiempo real
+        # y eventos de progreso cuando cada nodo termina
+        _TRACKED_NODES = {
+            "classify_intent", "retrieve", "agent_reason",
+            "generate_grounded", "eval_agent",
+        }
+        streamed_answer = False
+
         try:
-            final = await graph.ainvoke(inputs, config=config)
-            answer = final.get("answer", "")
-            if isinstance(answer, str) and answer.strip():
-                yield {"event": "token", "data": answer}
+            async for event in graph.astream_events(inputs, config=config, version="v2"):
+                kind = event["event"]
+
+                # Tokens del nodo generate_grounded en tiempo real
+                if kind == "on_chat_model_stream":
+                    node = event.get("metadata", {}).get("langgraph_node", "")
+                    if node == "generate_grounded":
+                        chunk = event["data"].get("chunk")
+                        token = getattr(chunk, "content", "") if chunk else ""
+                        if token:
+                            # Escapar newlines para que SSE no los corte
+                            yield {"event": "token", "data": token.replace("\n", "\\n")}
+                            streamed_answer = True
+
+                # Progreso: notificar cuando cada nodo termina
+                elif kind == "on_chain_end":
+                    name = event.get("name", "")
+                    if name in _TRACKED_NODES:
+                        yield {"event": "progress", "data": name}
+
         except Exception as exc:
             yield {"event": "token", "data": f"Error interno: {exc}"}
+
+        # Fallback: si no se streamearon tokens (ej: answer_general o sin contexto)
+        if not streamed_answer:
+            try:
+                final_state = await graph.aget_state(config)
+                answer = final_state.values.get("answer", "")
+                if isinstance(answer, str) and answer.strip():
+                    yield {"event": "token", "data": answer.replace("\n", "\\n")}
+            except Exception:
+                pass
 
         # Emitir trazabilidad desde el estado final del grafo
         try:
