@@ -42,7 +42,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("RAG Autos")
+st.title("RAG Agéntico - Fichas técnicas de vehículos")
 st.caption("Preguntas sobre fichas técnicas, comparaciones y recomendaciones.")
 
 if "session_id" not in st.session_state:
