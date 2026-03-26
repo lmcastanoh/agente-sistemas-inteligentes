@@ -64,3 +64,5 @@ node_modules/
 *.pem
 *.key
 *.env.local
+
+Fichas técnicas/ 

@@ -22,20 +22,86 @@ st.set_page_config(page_title="RAG Agéntico - Fichas técnicas de vehículos", 
 st.markdown(
     """
     <style>
+    /* ── Fondo general claro ── */
     .stApp {
-        background: radial-gradient(1200px 700px at 30% -10%, #1b2c4a 0%, #0a1220 45%, #070b12 100%);
+        background: linear-gradient(135deg, #f5f7fa 0%, #e4ecf5 100%);
+        color: #1e293b;
     }
     .block-container {
         padding-top: 1.8rem;
         max-width: 980px;
     }
+
+    /* ── Sidebar ── */
     [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #1f2430 0%, #1a1f2a 100%);
+        background: linear-gradient(180deg, #1e3a5f 0%, #162d4a 100%);
+    }
+    [data-testid="stSidebar"] * {
+        color: #e2e8f0 !important;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        background-color: #2563eb;
+        color: #ffffff !important;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        transition: background-color 0.2s;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background-color: #1d4ed8;
+    }
+    [data-testid="stSidebar"] input {
+        background-color: #1e3a5f !important;
+        border: 1px solid #3b6aa0 !important;
+        border-radius: 8px !important;
+        color: #e2e8f0 !important;
+    }
+
+    /* ── Título y caption ── */
+    h1 {
+        color: #1e3a5f !important;
+        font-weight: 700 !important;
+    }
+    .stCaption, [data-testid="stCaptionContainer"] {
+        color: #64748b !important;
+    }
+
+    /* ── Mensajes del chat ── */
+    [data-testid="stChatMessage"] {
+        background-color: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 0.75rem;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     }
     [data-testid="stChatMessage"] p,
     [data-testid="stChatMessage"] li {
         font-size: 1rem !important;
         line-height: 1.55 !important;
+        color: #1e293b !important;
+    }
+
+    /* ── Input del chat ── */
+    [data-testid="stChatInput"] textarea {
+        background-color: #ffffff !important;
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 12px !important;
+        color: #1e293b !important;
+    }
+
+    /* ── Expander trazabilidad ── */
+    .streamlit-expanderHeader {
+        background-color: #f0f4f8 !important;
+        border-radius: 8px !important;
+        color: #1e3a5f !important;
+        font-weight: 600 !important;
+    }
+    .streamlit-expanderContent {
+        background-color: #f8fafc !important;
+        border: 1px solid #e2e8f0 !important;
+        border-radius: 0 0 8px 8px !important;
+        color: #334155 !important;
     }
     </style>
     """,
