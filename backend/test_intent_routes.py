@@ -40,8 +40,6 @@ def main():
         print(
             f"    intent={intent.intent} | needs_retrieval={intent.needs_retrieval} | route={route_from_intent(intent)}"
         )
-        if intent.clarification_question:
-            print(f"    clarification_question={intent.clarification_question}")
 
 
 if __name__ == "__main__":

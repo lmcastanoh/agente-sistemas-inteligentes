@@ -2,7 +2,6 @@
 # ==============================================================================
 # Modelos Pydantic para structured output de los LLMs del grafo RAG.
 # - IntentClassification: salida del clasificador de intencion (nodo classify_intent)
-# - GroundingEvaluation: salida del critico de grounding (nodo evaluate_grounding)
 # ==============================================================================
 from __future__ import annotations
 
@@ -59,7 +58,6 @@ class IntentClassification(BaseModel):
         needs_retrieval:         True si la consulta requiere busqueda en ChromaDB
         reason:                  Explicacion corta de por que se eligio ese intent
         entities:                Marca, modelo, ano y version extraidos de la consulta
-        clarification_question:  Pregunta de aclaracion si falta informacion (ej: ano/version)
         suggested_k:             Numero de chunks sugerido por el LLM (1-20), None para GENERAL
     """
 
@@ -67,33 +65,7 @@ class IntentClassification(BaseModel):
     needs_retrieval: bool
     reason: str = Field(min_length=1, max_length=240)
     entities: IntentEntities
-    clarification_question: Optional[str] = None
     suggested_k: Optional[int] = Field(default=None, ge=1, le=20)
-
-
-class GroundingEvaluation(BaseModel):
-    """Resultado de la evaluacion del critico de grounding.
-
-    El critico (gpt-5-nano) evalua si la respuesta generada cumple con las
-    reglas de grounding: soportada por contexto, con citas, y completa.
-
-    Campos:
-        approved:               True si la respuesta pasa la evaluacion
-        score:                  Puntuacion de calidad (0.0 = muy mala, 1.0 = perfecta)
-        supported_by_context:   True si toda la informacion proviene del contexto
-        has_citations:          True si incluye citas en formato [doc_id=...; pagina=...]
-        complete_enough:        True si la respuesta es suficientemente completa
-        issues:                 Lista de problemas detectados (usada como feedback en reintentos)
-        clarification_question: Pregunta sugerida si la respuesta es insuficiente
-    """
-
-    approved: bool
-    score: float = Field(ge=0.0, le=1.0)
-    supported_by_context: bool
-    has_citations: bool
-    complete_enough: bool
-    issues: list[str] = Field(default_factory=list)
-    clarification_question: Optional[str] = None
 
 
 def intent_to_dict(intent: IntentClassification) -> dict[str, Any]:
@@ -104,19 +76,6 @@ def intent_to_dict(intent: IntentClassification) -> dict[str, Any]:
     data = intent.model_dump()
     if data.get("reason"):
         data["reason"] = _fix_encoding(data["reason"])
-    if data.get("clarification_question"):
-        data["clarification_question"] = _fix_encoding(data["clarification_question"])
     return data
 
 
-def eval_to_dict(result: GroundingEvaluation) -> dict[str, Any]:
-    """Convierte GroundingEvaluation a dict para almacenar en RAGState.
-
-    Aplica _fix_encoding a los campos de texto para corregir caracteres
-    corruptos (mojibake) que el LLM puede generar con acentos españoles.
-    """
-    data = result.model_dump()
-    data["issues"] = [_fix_encoding(s) for s in data.get("issues", [])]
-    if data.get("clarification_question"):
-        data["clarification_question"] = _fix_encoding(data["clarification_question"])
-    return data

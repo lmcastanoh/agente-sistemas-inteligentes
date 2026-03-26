@@ -2,12 +2,11 @@
 # ==============================================================================
 # Grafo LangGraph agéntico del sistema RAG para fichas técnicas vehiculares.
 #
-# Flujo: classify_intent → retrieve → agent_reason → generate_grounded →
-#        evaluate_grounding → [retry | END]
+# Flujo: classify_intent → retrieve → agent_reason → generate_grounded → END
 #
-# 3 rutas posibles:
+# 2 rutas posibles:
 #   A) GENERAL:  classify → answer_general → END (sin retrieval)
-#   B) RAG:      classify → retrieve → agent_reason → generate → evaluate → END
+#   B) RAG:      classify → retrieve → agent_reason → generate → END
 #                (el agente ReAct decide autónomamente qué tools usar en loop)
 #
 # Features:
@@ -15,7 +14,6 @@
 #   - Retrieval autónomo: tool refinar_busqueda permite re-buscar con query diferente
 #   - Auto-reflexión: integrada en el prompt del agente ReAct
 #   - Dynamic k: el clasificador sugiere cuantos chunks recuperar
-#   - Regeneration loop: el critico puede rechazar y forzar un reintento (max 1)
 #   - Memory: last_model/last_make persisten entre turnos con reducer _keep_latest
 #   - Keyword fallback: regex corrige clasificaciones erroneas del LLM
 #   - Trazabilidad: cada nodo registra su ruta, decisiones, chunks y prompt
@@ -37,20 +35,21 @@ from langgraph.prebuilt import ToolNode
 from prompts import (
     CLASSIFIER_SYSTEM_PROMPT,
     CLASSIFIER_USER_TEMPLATE,
+    EVAL_AGENT_SYSTEM_PROMPT,
     GROUNDED_GENERATION_SYSTEM_PROMPT,
     GROUNDED_GENERATION_USER_TEMPLATE,
-    GROUNDING_CRITIC_SYSTEM_PROMPT,
-    GROUNDING_CRITIC_USER_TEMPLATE,
     REACT_AGENT_SYSTEM_PROMPT,
 )
 from rag_store import get_vector_store
-from schemas import GroundingEvaluation, IntentClassification, eval_to_dict, intent_to_dict
+from schemas import IntentClassification, intent_to_dict
 from tools import (
     buscar_especificacion,
     buscar_por_marca,
     comparar_modelos,
+    corregir_respuesta,
     listar_modelos_disponibles,
     refinar_busqueda,
+    regenerar_respuesta,
     resumir_ficha,
 )
 
@@ -191,11 +190,6 @@ def _extract_comparison_models(question: str) -> list[str] | None:
     return [m.group(1).strip(), m.group(2).strip()]
 
 
-# ── Configuracion del regeneration loop ──────────────────────────────────────
-# Numero maximo de reintentos cuando el critico rechaza la respuesta (score < 0.5).
-# En cada reintento, el feedback del critico se inyecta como instruccion de correccion.
-MAX_RETRIES = 1
-
 
 def _keep_latest(existing: Optional[str], new: Optional[str]) -> Optional[str]:
     """Reducer para last_model y last_make en RAGState.
@@ -239,14 +233,12 @@ class RAGState(TypedDict):
     answer: str
     messages: Annotated[List[BaseMessage], add_messages]
     intent: Optional[dict[str, Any]]
-    eval_result: Optional[dict[str, Any]]
     agent_steps: list[dict[str, Any]]
     agent_context: str
+    eval_steps: list[dict[str, Any]]
     trazabilidad: dict[str, Any]
     last_model: Annotated[Optional[str], _keep_latest]
     last_make: Annotated[Optional[str], _keep_latest]
-    retry_count: int
-    critic_feedback: Optional[list[str]]
 
 
 # ── Funciones auxiliares ─────────────────────────────────────────────────────
@@ -392,11 +384,10 @@ def build_rag_graph():
     ]
     tool_node = ToolNode(tools)
 
-    # 4 LLMs especializados (todos gpt-5-nano con diferentes temperatures)
+    # 3 LLMs especializados (todos gpt-5-nano con diferentes temperatures)
     router_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)      # Clasificador: determinista
     answer_llm = ChatOpenAI(model="gpt-5-nano", temperature=0.2)     # Generador: leve creatividad
     answer_llm_with_tools = answer_llm.bind_tools(tools)             # Generador con tools bindeadas
-    critic_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)       # Critico: determinista
     rewrite_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)      # Rewriter de queries
 
     # ── Nodo 1: classify_intent ──────────────────────────────────────────
@@ -460,8 +451,8 @@ def build_rag_graph():
                     intent_data["entities"]["make"] = prev_make
                 intent_data["_model_from_memory"] = True
 
-        # Registrar en trazabilidad
-        traza = dict(state.get("trazabilidad") or {})
+        # Registrar en trazabilidad (dict limpio: cada turno empieza de cero)
+        traza: dict[str, Any] = {}
         traza["ruta"] = ["classify_intent"]
         traza["clasificacion"] = intent_data
         traza["decision"] = {
@@ -626,7 +617,7 @@ def build_rag_graph():
         return {"docs": docs, "trazabilidad": traza}
 
     # ── Limite de iteraciones del agente ReAct ────────────────────────────
-    MAX_AGENT_ITERATIONS = 5
+    MAX_AGENT_ITERATIONS = 3
 
     # ── Nodo 3: agent_reason (ReAct loop) ─────────────────────────────────
     def agent_reason(state: RAGState) -> dict[str, Any]:
@@ -703,12 +694,12 @@ def build_rag_graph():
         }
 
     # ── Nodo 4: generate_grounded ──────────────────────────────────────
-    def generate_grounded(state: RAGState) -> dict[str, Any]:
-        """Genera la respuesta final con grounding estricto.
+    async def generate_grounded(state: RAGState) -> dict[str, Any]:
+        """Genera la respuesta final con grounding estricto (async para streaming).
 
         Combina contexto de retrieval (chunks de ChromaDB) con output del agente
         ReAct (si usó tools) y genera la respuesta usando el LLM con reglas
-        estrictas anti-hallucination.
+        estrictas anti-hallucination. Usa astream para emitir tokens en tiempo real.
 
         Si es un reintento (critic_feedback presente), adjunta las instrucciones
         de correccion del critico al prompt para que el LLM corrija los problemas.
@@ -750,33 +741,17 @@ def build_rag_graph():
                 "origen_respuesta": "generate_grounded",
             }
 
-        # Construir instruccion de correccion si es un reintento del regeneration loop
-        critic_feedback = state.get("critic_feedback")
-        critic_instruction = ""
-        if critic_feedback:
-            critic_instruction = (
-                "\n\n=== CORRECCIÓN REQUERIDA ===\n"
-                "Tu respuesta anterior fue rechazada por el crítico. Corrige estos problemas:\n"
-                + "\n".join(f"- {fb}" for fb in critic_feedback)
-                + "\nGenera una nueva respuesta corregida."
-            )
-
         prompt_repr = {
             "modo": "grounded_rag",
             "question": question,
             "retrieved_count": len(docs),
             "agent_context_included": bool(agent_context),
-            "formato_cita": "[doc_id=...; página=...; chunk_id=...]",
-            "retry_count": state.get("retry_count", 0),
-            "has_critic_feedback": bool(critic_feedback),
         }
 
         user_content = GROUNDED_GENERATION_USER_TEMPLATE.format(
             question=question,
             context=combined_context,
         )
-        if critic_instruction:
-            user_content += critic_instruction
 
         # Guardar snippets de chunks para trazabilidad (primeros 200 chars de cada chunk)
         chunk_snippets = []
@@ -794,13 +769,15 @@ def build_rag_graph():
 
         # NO pasar historial de conversacion para evitar contaminacion.
         # El query ya fue reescrito en retrieve() para ser autocontenido.
-        response = answer_llm_with_tools.invoke(
-            [
-                SystemMessage(content=GROUNDED_GENERATION_SYSTEM_PROMPT),
-                HumanMessage(content=user_content),
-            ]
-        )
-        answer = response.content if isinstance(response.content, str) else str(response.content)
+        # Usa astream para habilitar streaming token-by-token via astream_events.
+        llm_messages = [
+            SystemMessage(content=GROUNDED_GENERATION_SYSTEM_PROMPT),
+            HumanMessage(content=user_content),
+        ]
+        answer = ""
+        async for chunk in answer_llm_with_tools.astream(llm_messages):
+            if chunk.content:
+                answer += chunk.content
 
         traza = dict(state.get("trazabilidad") or {})
         traza["ruta"] = traza.get("ruta", []) + ["generate_grounded"]
@@ -809,110 +786,89 @@ def build_rag_graph():
         traza["chunks_con_contenido"] = chunk_snippets
         return {
             "answer": answer,
-            "messages": [response],
+            "messages": [AIMessage(content=answer)],
             "trazabilidad": traza,
             "origen_respuesta": "generate_grounded",
         }
 
-    # ── Nodo 7: evaluate_grounding ───────────────────────────────────────
-    def evaluate_grounding(state: RAGState) -> dict[str, Any]:
-        """Critico de grounding: evalua la calidad de la respuesta generada.
+    # ── Nodo 6: eval_agent (evaluador agéntico de grounding) ─────────────
+    eval_tools = [corregir_respuesta, regenerar_respuesta, refinar_busqueda]
+    eval_llm = ChatOpenAI(model="gpt-5-nano", temperature=0).bind_tools(eval_tools)
+    eval_tool_node = ToolNode(eval_tools)
+    MAX_EVAL_ITERATIONS = 2
 
-        Evalua 5 criterios: soportada_por_contexto, tiene_citas, suficiente,
-        aprobada y score (0.0-1.0).
+    def eval_agent(state: RAGState) -> dict[str, Any]:
+        """Agente evaluador de grounding: evalúa y corrige la respuesta si es necesario.
 
-        Tres caminos posibles:
-        1. Aprobada (score >= 0.5 o approved=true) → flujo termina
-        2. Rechazada + puede reintentar (score < 0.5, retry_count < MAX_RETRIES)
-           → guarda feedback en critic_feedback, incrementa retry_count,
-             el conditional edge redirige a generate_grounded
-        3. Rechazada + sin reintentos → reemplaza respuesta con fallback seguro
+        Ciclo: evaluar → corregir/regenerar (si hay problemas) → respuesta final.
+        Si la respuesta es buena, la pasa tal cual.
+        Si hay problemas menores, usa corregir_respuesta.
+        Si hay problemas graves, usa refinar_busqueda + regenerar_respuesta.
 
-        Retorna: eval_result, trazabilidad (con retry_number y will_retry),
-                 opcionalmente retry_count, critic_feedback o answer de fallback
+        Retorna: answer (corregida o aprobada), eval_steps, trazabilidad
         """
+        question = state["question"]
         docs = state.get("docs", [])
         answer = state.get("answer", "")
-        question = state["question"]
-        retry_count = state.get("retry_count", 0)
+        context = _retrieval_context(docs) if docs else ""
+        agent_context = state.get("agent_context", "")
 
-        # Enviar al critico: pregunta + chunks + respuesta a evaluar
-        retrieved_chunks_json = json.dumps(_retrieved_chunk_payload(docs), ensure_ascii=False)
-        structured = critic_llm.with_structured_output(GroundingEvaluation)
-        result: GroundingEvaluation = structured.invoke(
-            [
-                SystemMessage(content=GROUNDING_CRITIC_SYSTEM_PROMPT),
-                HumanMessage(
-                    content=GROUNDING_CRITIC_USER_TEMPLATE.format(
-                        question=question,
-                        retrieved_chunks=retrieved_chunks_json,
-                        answer=answer,
-                    )
-                ),
-            ]
+        if agent_context:
+            full_context = context + "\n\n" + agent_context if context else agent_context
+        else:
+            full_context = context
+
+        system_prompt = EVAL_AGENT_SYSTEM_PROMPT.format(
+            question=question, context=full_context, answer=answer,
         )
-        eval_data = eval_to_dict(result)
 
-        updates: dict[str, Any] = {}
-        replaced = False
-        rejected = not eval_data.get("approved", True) and eval_data.get("score", 1.0) < 0.5
-        can_retry = rejected and retry_count < MAX_RETRIES
+        eval_messages: list[BaseMessage] = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Evalúa la respuesta y devuelve la versión final."),
+        ]
 
-        if can_retry:
-            # Regeneration loop: guardar feedback del critico e incrementar contador
-            updates["retry_count"] = retry_count + 1
-            updates["critic_feedback"] = eval_data.get("issues", [])
-        elif rejected:
-            # Max reintentos agotados — reemplazar con respuesta fallback segura
-            issues = eval_data.get("issues", [])
-            clarification = eval_data.get("clarification_question")
-            fallback_parts = [
-                "No fue posible generar una respuesta confiable basada en el contexto disponible."
-            ]
-            if issues:
-                fallback_parts.append("Problemas detectados: " + "; ".join(issues) + ".")
-            if clarification:
-                fallback_parts.append(clarification)
-            fallback_answer = "\n\n".join(fallback_parts)
-            updates["answer"] = fallback_answer
-            updates["messages"] = [AIMessage(content=fallback_answer)]
-            replaced = True
+        steps: list[dict[str, Any]] = []
+        final_answer = answer
 
-        # Registrar verificacion en trazabilidad
+        for i in range(MAX_EVAL_ITERATIONS):
+            response = eval_llm.invoke(eval_messages)
+            eval_messages.append(response)
+
+            if not response.tool_calls:
+                final_answer = response.content or answer
+                steps.append({
+                    "step": i + 1,
+                    "type": "approved",
+                    "content": final_answer[:200],
+                })
+                break
+
+            tool_result = eval_tool_node.invoke({"messages": [response]})
+            tool_msgs = tool_result.get("messages", [])
+            for tm in tool_msgs:
+                eval_messages.append(tm)
+
+            for tc in response.tool_calls:
+                steps.append({
+                    "step": i + 1,
+                    "type": "correction",
+                    "tool": tc["name"],
+                    "args": {k: str(v)[:100] for k, v in tc["args"].items()},
+                })
+
         traza = dict(state.get("trazabilidad") or {})
-        traza["ruta"] = traza.get("ruta", []) + ["evaluate_grounding"]
-        traza["verificacion"] = {
-            "aprobada": eval_data.get("approved"),
-            "puntuacion": eval_data.get("score"),
-            "soportada_en_contexto": eval_data.get("supported_by_context"),
-            "tiene_citas": eval_data.get("has_citations"),
-            "suficiente": eval_data.get("complete_enough"),
-            "issues": eval_data.get("issues", []),
-            "pregunta_aclaracion": eval_data.get("clarification_question"),
-            "respuesta_reemplazada": replaced,
-            "retry_number": retry_count,
-            "will_retry": can_retry,
+        traza["ruta"] = traza.get("ruta", []) + ["eval_agent"]
+        traza["eval_steps"] = steps
+        traza["eval_modified"] = final_answer != answer
+
+        return {
+            "answer": final_answer,
+            "eval_steps": steps,
+            "messages": [AIMessage(content=final_answer)],
+            "trazabilidad": traza,
         }
-        updates["eval_result"] = eval_data
-        updates["trazabilidad"] = traza
-        return updates
 
     # ── Funciones de routing (conditional edges) ─────────────────────────
-
-    def route_after_evaluate(state: RAGState) -> str:
-        """Decide si reintentar generacion o terminar despues de la evaluacion.
-
-        Si la respuesta fue rechazada (score < 0.5) y hay reintentos disponibles
-        (retry_count <= MAX_RETRIES) y hay feedback del critico, redirige a
-        generate_grounded para un nuevo intento con las correcciones.
-        Si no, termina el grafo.
-        """
-        eval_data = state.get("eval_result") or {}
-        retry_count = state.get("retry_count", 0)
-        rejected = not eval_data.get("approved", True) and eval_data.get("score", 1.0) < 0.5
-        if rejected and retry_count < MAX_RETRIES and state.get("critic_feedback"):
-            return "generate_grounded"
-        return END
 
     def route_after_classify(state: RAGState) -> str:
         """Decide ruta despues de clasificar: retrieval o respuesta general directa."""
@@ -925,13 +881,13 @@ def build_rag_graph():
 
     graph = (
         StateGraph(RAGState)
-        # Nodos (6: classify, answer_general, retrieve, agent_reason, generate, evaluate)
+        # Nodos (6: classify, answer_general, retrieve, agent_reason, generate, eval)
         .add_node("classify_intent", classify_intent)
         .add_node("answer_general", answer_general)
         .add_node("retrieve", retrieve)
         .add_node("agent_reason", agent_reason)
         .add_node("generate_grounded", generate_grounded)
-        .add_node("evaluate_grounding", evaluate_grounding)
+        .add_node("eval_agent", eval_agent)
         # Edges
         .add_edge(START, "classify_intent")
         .add_conditional_edges(
@@ -942,13 +898,8 @@ def build_rag_graph():
         .add_edge("answer_general", END)
         .add_edge("retrieve", "agent_reason")
         .add_edge("agent_reason", "generate_grounded")
-        .add_edge("generate_grounded", "evaluate_grounding")
-        .add_conditional_edges(
-            "evaluate_grounding",
-            route_after_evaluate,
-            {"generate_grounded": "generate_grounded", END: END},
-        )
+        .add_edge("generate_grounded", "eval_agent")
+        .add_edge("eval_agent", END)
         .compile(checkpointer=MemorySaver())
     )
-    print(graph.get_graph().draw_ascii())
     return graph
