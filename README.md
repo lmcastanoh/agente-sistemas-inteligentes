@@ -1,19 +1,20 @@
-# Sistema RAG para Fichas Tecnicas Vehiculares
+# RAG Agentico - Fichas Tecnicas Vehiculares
 
-Sistema de Generacion Aumentada por Recuperacion (RAG) especializado en fichas tecnicas
-de vehiculos. Permite consultar, resumir y comparar especificaciones de multiples marcas
-y modelos usando lenguaje natural.
+Sistema de Generacion Aumentada por Recuperacion (RAG) **agentico** especializado en fichas tecnicas
+de vehiculos. Usa agentes ReAct con razonamiento autonomo para consultar, resumir y comparar
+especificaciones de multiples marcas y modelos usando lenguaje natural.
 
 ## Stack Tecnologico
 
 | Componente | Tecnologia |
 |------------|-----------|
 | Backend API | FastAPI + Uvicorn |
-| Orquestacion | LangGraph (grafo de estados) |
+| Orquestacion | LangGraph (grafo de estados con agentes ReAct) |
 | LLM | OpenAI `gpt-5-nano` |
 | Embeddings | HuggingFace `all-MiniLM-L6-v2` |
 | Base vectorial | ChromaDB (persistencia local) |
 | Frontend | Streamlit |
+| Streaming | SSE token-by-token via `astream_events` |
 | OCR | EasyOCR (paginas escaneadas) |
 | Extraccion PDF | pdfplumber |
 
@@ -22,16 +23,16 @@ y modelos usando lenguaje natural.
 ## Estructura del Proyecto
 
 ```
-rag-ing-ontologica/
-│
+agente-sistemas-inteligentes/
 ├── backend/
-│   ├── app.py              # API FastAPI: endpoints /ingest y /chat/stream
-│   ├── rag_graph.py         # Grafo LangGraph: flujo completo del RAG
+│   ├── app.py              # API FastAPI: /ingest y /chat/stream (SSE streaming real)
+│   ├── rag_graph.py         # Grafo LangGraph: 6 nodos con agentes ReAct
 │   ├── rag_store.py         # ChromaDB: ingestion, embeddings, vector store
-│   ├── tools.py             # Tools de LangGraph (listar, buscar, comparar, resumir)
-│   ├── schemas.py           # Modelos Pydantic (IntentClassification, GroundingEvaluation)
-│   ├── prompts.py           # System prompts (clasificador, generador, critico)
-│   ├── data/                # PDFs organizados por marca (Toyota/, Mazda/, etc.)
+│   ├── tools.py             # 8 tools (buscar, comparar, resumir, refinar, corregir, regenerar)
+│   ├── schemas.py           # Modelos Pydantic (IntentClassification)
+│   ├── prompts.py           # System prompts (clasificador, agente ReAct, generador, evaluador)
+│   ├── test_intent_routes.py # Tests de clasificacion de intent
+│   ├── data/                # PDFs organizados por marca
 │   │   ├── Toyota/
 │   │   ├── Mazda/
 │   │   ├── Volkswagen/
@@ -40,10 +41,8 @@ rag-ing-ontologica/
 │   │   ├── MG Emotor/
 │   │   └── Seat/
 │   └── chroma_db/           # Base vectorial persistida (SQLite + HNSW)
-│
 ├── frontend/
-│   └── streamlit_app.py     # Interfaz de chat Streamlit
-│
+│   └── streamlit_app.py     # Interfaz de chat con streaming y trazabilidad
 ├── .env                     # Variables de entorno (OPENAI_API_KEY, HF_TOKEN)
 ├── requeriments.txt         # Dependencias Python
 └── README.md
@@ -53,23 +52,23 @@ rag-ing-ontologica/
 
 ## Datos Disponibles
 
-- **6 marcas**: Toyota, Mazda, Volkswagen, Peugeot, Opel, MG Emotor, Seat
+- **7 marcas**: Toyota, Mazda, Volkswagen, Peugeot, Opel, MG Emotor, Seat
 - **50 modelos** indexados
-- **584 chunks** en ChromaDB
+- **584 chunks** en ChromaDB (chunks de 1000 chars, overlap 150)
 - Metadata por chunk: `source`, `page`, `marca`, `modelo`, `doc_id`, `chunk_id`, `ocr`
 
 ---
 
-## Flujo General del Grafo RAG
+## Arquitectura del Grafo RAG Agentico
 
-El sistema usa un grafo de estados LangGraph con 8 nodos y 4 rutas posibles:
+El sistema usa un grafo LangGraph con **6 nodos** y **2 agentes ReAct**:
 
 ```
 START
   │
   ▼
 ┌─────────────────────┐
-│  1. classify_intent  │  LLM clasifica la pregunta en 4 intents
+│  1. classify_intent  │  LLM clasifica en 4 intents + extrae entidades
 └──────────┬──────────┘
            │
     ┌──────┴──────────────────────┐
@@ -83,97 +82,124 @@ START
        │                        │
        ▼                        ▼
       END              ┌──────────────────┐
-                       │  3. decide_tools  │  ¿Comparacion o Resumen?
+                       │  3. agent_reason  │  Agente ReAct: razona y usa tools
+                       │  (loop autonomo)  │  en ciclo reason → act → observe
                        └────────┬─────────┘
                                 │
-                    ┌───────────┴───────────┐
-                    │                       │
-              usar_tools=true         usar_tools=false
-                    │                       │
-                    ▼                       │
-           ┌───────────────┐                │
-           │  4. call_tools │  LLM genera   │
-           └───────┬───────┘  tool_calls    │
-                   │                        │
-                   ▼                        │
-           ┌───────────────┐                │
-           │   5. tools     │  Ejecuta      │
-           └───────┬───────┘  las tools     │
-                   │                        │
-                   ▼                        │
-           ┌───────────────────────┐◄───────┘
-           │ 6. generate_grounded  │  Genera respuesta con citas
-           └───────────┬───────────┘
-                       │        ▲
-                       ▼        │ retry (score < 0.5 y retry < 1)
-           ┌───────────────────────┐
-           │ 7. evaluate_grounding │  Critico evalua calidad
-           └───────┬───────┬───────┘
-                   │       │
-              aprobado   rechazado + max retries
-                   │       │
-                   ▼       ▼
-                  END   fallback seguro → END
+                                ▼
+                       ┌──────────────────────┐
+                       │ 4. generate_grounded │  Genera respuesta con citas
+                       │  (streaming async)   │  desde contexto + output agente
+                       └────────┬─────────────┘
+                                │
+                                ▼
+                       ┌──────────────────┐
+                       │  5. eval_agent    │  Agente evaluador: verifica y
+                       │  (loop autonomo)  │  corrige si hay problemas
+                       └────────┬─────────┘
+                                │
+                                ▼
+                               END
 ```
 
 ### Rutas del grafo
 
-| Ruta | Intent | Nodos | Descripcion |
-|------|--------|-------|-------------|
-| **A** | GENERAL | classify → answer_general → END | Conocimiento general sin retrieval |
-| **B** | Busqueda | classify → retrieve → decide_tools → generate → evaluate → END | Dato tecnico puntual |
-| **C** | Resumen | classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END | Ficha completa con tool `resumir_ficha` |
-| **D** | Comparacion | classify → retrieve → decide_tools → call_tools → tools → generate → evaluate → END | Tabla comparativa con tool `comparar_modelos` |
+| Ruta | Intent | Flujo |
+|------|--------|-------|
+| **A** | GENERAL | classify → answer_general → END |
+| **B** | Busqueda / Resumen / Comparacion | classify → retrieve → agent_reason → generate → eval_agent → END |
 
-### Detalle de cada nodo
+---
 
-#### 1. `classify_intent` — Clasificador de intencion
-- **LLM**: gpt-5-nano (temperature=0)
+## Detalle de cada nodo
+
+### 1. `classify_intent` — Clasificador de intencion
+- **LLM**: gpt-5-nano (temperature=0, structured output)
 - Clasifica en: Busqueda, Resumen, Comparacion, GENERAL
 - Extrae entidades: marca, modelo, ano, version
 - Sugiere `suggested_k` (cuantos chunks recuperar)
 - Memory: si no hay modelo en la pregunta, usa `last_model`/`last_make` del turno anterior
 - Keyword fallback: regex corrige clasificaciones erroneas
 
-#### 2. `retrieve` — Recuperacion semantica
-- Busca en ChromaDB usando `similarity_search`
-- **Dynamic k**: usa `suggested_k` del clasificador o mapa fijo
-- Reescribe la query para resolver referencias ("ese modelo" → nombre real)
+### 2. `retrieve` — Recuperacion semantica
+- Busca en ChromaDB con `similarity_search`
+- **Dynamic k**: usa `suggested_k` del clasificador o mapa fijo por intent
+- Reescribe la query para resolver referencias anaforicas ("ese modelo" → nombre real)
 - Filtros de metadata por marca/modelo con variantes normalizadas
 - Comparaciones: retrieval balanceado (k/2 por cada modelo)
 
-#### 3. `decide_tools` — Decision determinista
-- Comparacion y Resumen siempre activan tools
-- Busqueda no usa tools (genera directo desde contexto)
-- Keyword fallback como segunda red de seguridad
+### 3. `agent_reason` — Agente ReAct (razonamiento autonomo)
+- **LLM**: gpt-5-nano (temperature=0.2, tools bindeadas)
+- **Ciclo ReAct**: reason → act (tool_call) → observe → reason (max 3 iteraciones)
+- Decide autonomamente que tools usar segun el contexto
+- Auto-reflexion integrada: verifica si el contexto es suficiente antes de responder
+- Verificacion de relevancia: no mezcla datos de modelos diferentes
+- Si el contexto es insuficiente, usa `refinar_busqueda` con query reformulada
 
-#### 4. `call_tools` + `tools` — Ejecucion de herramientas
-- **Tools disponibles**:
-  - `listar_modelos_disponibles` — catalogo de modelos indexados
-  - `buscar_especificacion` — dato tecnico puntual
-  - `buscar_por_marca` — todos los modelos de una marca
-  - `comparar_modelos` — tabla comparativa markdown
-  - `resumir_ficha` — resumen estructurado markdown
+### 4. `generate_grounded` — Generacion con grounding (async streaming)
+- **LLM**: gpt-5-nano (temperature=0.2, async con `astream`)
+- Combina contexto de retrieval + output del agente ReAct
+- Citas como referencias numeradas [1], [2] con seccion **Fuentes** al final
+- Anti-hallucination: verifica que los chunks correspondan al modelo pedido
+- Streaming token-by-token hacia el frontend
 
-#### 5. `generate_grounded` — Generacion con grounding
-- Combina contexto de retrieval + output de tools
-- Citas obligatorias: `[doc_id=<archivo>; pagina=<N>]`
-- Si es reintento, incluye feedback del critico como correccion
-- Guarda trazabilidad: prompt completo, snippets de chunks
+### 5. `eval_agent` — Agente evaluador de grounding
+- **LLM**: gpt-5-nano (temperature=0, tools bindeadas)
+- **Ciclo ReAct**: evalua → corrige si hay problemas (max 2 iteraciones)
+- Si la respuesta es buena, la pasa tal cual (sin cambios)
+- Si hay problemas menores (formato, citas): usa `corregir_respuesta`
+- Si hay problemas graves (modelo equivocado, datos inventados): usa `refinar_busqueda` + `regenerar_respuesta`
 
-#### 6. `evaluate_grounding` — Critico de calidad
-- Evalua: soportada por contexto, tiene citas, es completa
-- Score 0.0 - 1.0
-- Si rechazada (score < 0.5) y hay reintentos disponibles → vuelve a generar
-- Si rechazada sin reintentos → respuesta fallback segura
-- Maximo 1 reintento (configurable con `MAX_RETRIES`)
+---
 
-### Features adicionales
+## Tools disponibles (8)
 
-- **Regeneration loop**: el critico puede rechazar y forzar un reintento con feedback correctivo
-- **Memory conversacional**: `last_model`/`last_make` persisten entre turnos con reducer `_keep_latest`
-- **Trazabilidad completa**: cada nodo registra su paso, decisiones, chunks, prompt enviado
-- **Anti-hallucination**: keyword override, grounding estricto, fallback seguro
+| Tool | Descripcion | Usada por |
+|------|-------------|-----------|
+| `listar_modelos_disponibles` | Catalogo de modelos indexados en ChromaDB | agent_reason |
+| `buscar_especificacion` | Dato tecnico puntual (potencia, torque, etc.) | agent_reason |
+| `buscar_por_marca` | Todos los modelos de una marca | agent_reason |
+| `comparar_modelos` | Tabla comparativa markdown entre 2 modelos | agent_reason |
+| `resumir_ficha` | Resumen estructurado de ficha tecnica | agent_reason |
+| `refinar_busqueda` | Busqueda adicional con query/filtros diferentes | agent_reason, eval_agent |
+| `corregir_respuesta` | Corrige formato, citas, datos no respaldados | eval_agent |
+| `regenerar_respuesta` | Regenera respuesta completa desde contexto mejorado | eval_agent |
+
+---
+
+## Mecanismos anti-hallucination
+
+1. **Verificacion de modelo**: el agente ReAct y el generador verifican que los chunks correspondan al modelo pedido
+2. **Citas obligatorias**: referencias numeradas [1], [2] con seccion Fuentes
+3. **Evaluador agentico**: `eval_agent` verifica la respuesta y corrige si hay problemas
+4. **No-mezcla de modelos**: si el contexto tiene datos de otros modelos, los descarta
+5. **Declaracion explicita**: si no hay datos, dice "No se encontro informacion" en vez de inventar
+6. **Keyword fallback**: regex corrige clasificaciones erroneas del LLM
+
+---
+
+## Streaming y trazabilidad
+
+### Streaming SSE token-by-token
+- El backend usa `astream_events` para emitir tokens en tiempo real
+- El frontend muestra texto apareciendo progresivamente
+- Indicadores de progreso por nodo: "Clasificando intencion...", "Buscando documentos...", etc.
+
+### Eventos SSE
+| Evento | Contenido |
+|--------|-----------|
+| `token` | Token individual de la respuesta (con newlines escapados) |
+| `progress` | Nombre del nodo que acaba de terminar |
+| `trazabilidad` | JSON con ruta, clasificacion, chunks, pasos del agente, evaluacion |
+| `done` | Fin del stream |
+
+### Trazabilidad
+Cada respuesta incluye un panel expandible con:
+- Ruta del grafo (nodos ejecutados)
+- Intencion clasificada y si requiere RAG
+- Chunks recuperados (fuente, pagina, k utilizado)
+- Pasos del agente ReAct (tools invocadas y argumentos)
+- Evaluacion del `eval_agent` (aprobada o corregida)
 
 ---
 
@@ -188,8 +214,8 @@ START
 ### 1. Clonar el repositorio
 
 ```powershell
-git clone https://github.com/lmcastanoh/rag-ing-ontologica.git
-cd rag-ing-ontologica
+git clone https://github.com/lmcastanoh/agente-sistemas-inteligentes.git
+cd agente-sistemas-inteligentes
 ```
 
 ### 2. Crear entorno virtual
@@ -231,7 +257,7 @@ backend/data/
 ### 6. Ejecutar el backend (Terminal 1)
 
 ```powershell
-cd rag-ing-ontologica
+cd agente-sistemas-inteligentes
 .\.venv\Scripts\Activate
 cd backend
 uvicorn app:app --reload --port 8001
@@ -261,7 +287,7 @@ Respuesta esperada:
 ### 8. Ejecutar el frontend (Terminal 2)
 
 ```powershell
-cd rag-ing-ontologica
+cd agente-sistemas-inteligentes
 .\.venv\Scripts\Activate
 cd frontend
 streamlit run streamlit_app.py
@@ -287,17 +313,25 @@ Ingesta documentos PDF desde un directorio.
 
 ### `POST /chat/stream`
 
-Chat con streaming via Server-Sent Events (SSE).
+Chat con streaming SSE token-by-token.
 
 ```json
 // Request
 {"question": "¿Cual es la potencia del Toyota Hilux?", "session_id": "sesion-1"}
 ```
 
-Eventos SSE:
-- `token` — respuesta final del RAG
-- `trazabilidad` — JSON con la ruta completa, decisiones, chunks, evaluacion
-- `done` — fin del stream
+---
+
+## Ejemplos de preguntas
+
+| Tipo | Ejemplo |
+|------|---------|
+| Busqueda puntual | "¿Cual es la potencia del Toyota Hilux 2024?" |
+| Resumen | "Resume la ficha tecnica del Mazda CX-5" |
+| Comparacion | "Compara el Hilux vs el Fortuner" |
+| General | "¿Que es el torque?" |
+| Por marca | "¿Que modelos de Volkswagen tienen?" |
+| Refinamiento | "¿Y cuanto pesa?" (follow-up del modelo anterior) |
 
 ---
 
@@ -306,12 +340,8 @@ Eventos SSE:
 ### Puerto en uso
 
 ```powershell
-# Encontrar proceso usando el puerto
 netstat -ano | findstr :8001
-# Terminar proceso (reemplazar PID)
 taskkill /PID <PID> /F
-# O usar otro puerto
-uvicorn app:app --reload --port 8002
 ```
 
 ### Error de OpenAI 401
@@ -322,28 +352,9 @@ Verificar que `OPENAI_API_KEY` esta configurada en `.env`.
 
 Verificar creditos en: https://platform.openai.com/account/billing
 
-### Streamlit no encontrado
-
-```powershell
-pip install streamlit
-```
-
 ### EasyOCR lento en primera ejecucion
 
 Es normal: descarga modelos de ~100 MB la primera vez. Las ejecuciones siguientes usan cache.
-
----
-
-## Visualizar estructura del grafo
-
-El grafo se imprime en ASCII al iniciar el backend. Para generar diagrama Mermaid:
-
-```python
-# En rag_graph.py
-print(graph.get_graph().draw_mermaid())
-```
-
-Pegar el resultado en: https://mermaid.live
 
 ---
 
@@ -351,8 +362,8 @@ Pegar el resultado en: https://mermaid.live
 
 ```powershell
 # Backend
-cd rag-ing-ontologica && .\.venv\Scripts\Activate && cd backend && uvicorn app:app --reload --port 8001
+cd agente-sistemas-inteligentes && .\.venv\Scripts\Activate && cd backend && uvicorn app:app --reload --port 8001
 
 # Frontend (otra terminal)
-cd rag-ing-ontologica && .\.venv\Scripts\Activate && cd frontend && streamlit run streamlit_app.py
+cd agente-sistemas-inteligentes && .\.venv\Scripts\Activate && cd frontend && streamlit run streamlit_app.py
 ```
