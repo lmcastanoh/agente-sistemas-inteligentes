@@ -17,7 +17,7 @@ def _clean_markdown(text: str) -> str:
     return out
 
 
-st.set_page_config(page_title="RAG Autos", layout="wide")
+st.set_page_config(page_title="RAG Agéntico - Fichas técnicas de vehículos", layout="wide")
 
 st.markdown(
     """
